@@ -2,3 +2,8 @@ ansible
 elasticsearch
 sh
 boto3
+requests
+werkzeug
+flask
+flask-restful
+click
