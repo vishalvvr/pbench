@@ -1,5 +1,5 @@
 ansible
-elasticsearch
+elasticsearch1==1.10.0
 sh
 boto3
 requests
@@ -12,3 +12,5 @@ redis
 python-pidfile
 python-daemon
 bottle
+--find-links file:///home/dbutenho/github/pbench
+pyesbulk
