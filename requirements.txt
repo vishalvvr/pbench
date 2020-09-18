@@ -12,5 +12,4 @@ redis
 python-pidfile
 python-daemon
 bottle
---find-links file:///home/dbutenho/github/pbench
 pyesbulk
