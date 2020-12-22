@@ -54,6 +54,7 @@ Available tools:
 	user-tool
 	virsh-migrate
 	vmstat
+	pcp-transient
 	node-exporter
 	dcgm
 	pcp
