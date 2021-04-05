@@ -3,30 +3,43 @@
 
 import sys
 import json
+import argparse
 from pathlib import Path
 
-if len(sys.argv) != 4:
-    print("Usage: get-internal-tool <metadata_location> <tool_name> <tool_type>")
-    sys.exit()
 
-meta_loc = Path(sys.argv[1])
-name = sys.argv[2]
-tool_type = sys.argv[3]
+def exit_script(message):
+    print(message)
+    sys.exit(1)
 
+
+# Establishing script positional arguments
+parser = argparse.ArgumentParser(
+    description="Get the internal name of an existing tool given its type."
+)
+parser.add_argument("metadata_location")
+parser.add_argument("tool_name")
+parser.add_argument("tool_type")
+args = parser.parse_args()
+
+# Assigning received arguments for check/use
+meta_loc = Path(args.metadata_location)
+name = args.tool_name
+tool_type = args.tool_type
+
+# Check for valid metadata location
 try:
     meta = json.load(open(meta_loc / "meta.json"))
 except Exception as exc:
-    print(f"Failed to load tool metadata: {exc}")
-    sys.exit()
+    exit_script(f"Failed to load tool metadata: {exc}")
 
+# Check for valid tool type
 if tool_type not in ["persistent", "transient"]:
-    print(f"Tool type must be persistent or transient, cannot be: {tool_type}")
-    sys.exit()
+    exit_script(f"Tool type must be persistent or transient, cannot be: {tool_type}")
 
+# Find potential name, then check if valid
 if name not in meta[tool_type].keys():
     name = name + "-" + tool_type
     if name not in meta[tool_type].keys():
-        print(f"{name} is not an existing tool option")
-        sys.exit()
+        exit_script(f"{name} is not an existing tool option")
 
 print(name)
