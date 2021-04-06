@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def exit_script(message):
-    print(message)
+    print(message, file=sys.stderr)
     sys.exit(1)
 
 
@@ -18,7 +18,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument("metadata_location")
 parser.add_argument("tool_name")
-parser.add_argument("tool_type")
+parser.add_argument("tool_type", choices=["persistent", "transient"])
 args = parser.parse_args()
 
 # Assigning received arguments for check/use
@@ -31,10 +31,6 @@ try:
     meta = json.load(open(meta_loc / "meta.json"))
 except Exception as exc:
     exit_script(f"Failed to load tool metadata: {exc}")
-
-# Check for valid tool type
-if tool_type not in ["persistent", "transient"]:
-    exit_script(f"Tool type must be persistent or transient, cannot be: {tool_type}")
 
 # Find potential name, then check if valid
 if name not in meta[tool_type].keys():

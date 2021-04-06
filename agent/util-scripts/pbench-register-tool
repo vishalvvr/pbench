@@ -180,12 +180,18 @@ while true; do
 		shift
 		display_name=${name}
 		name=$(${pbench_bin}/util-scripts/get-internal-tool ${pbench_bin}/tool-scripts ${name} persistent)
+		if [[ ${name} == "" ]]; then
+			name="error"
+		fi
 		type="persistent"
 		;;
 	--transient)
 		shift
 		display_name=${name}
 		name=$(${pbench_bin}/util-scripts/get-internal-tool ${pbench_bin}/tool-scripts ${name} transient)
+		if [[ ${name} == "" ]]; then
+			name="error"
+		fi
 		type="transient"
 		;;
 	-h|--help)
@@ -205,7 +211,7 @@ if [[ -z ${name} ]]; then
 	exit 1
 fi
 if [[ ! -x "${pbench_bin}/tool-scripts/${name}" ]]; then
-	if [[ "${display_name}" != "" ]]; then
+	if [[ ${name} == "error" && "${display_name}" != "" ]]; then
 		error_log "Could not find ${display_name} with type ${type} in ${pbench_bin}/tool-scripts/: has the right type been specified?"
 	else
 		error_log "Could not find ${name} in ${pbench_bin}/tool-scripts/: has this tool been integrated into the pbench-agent?"
