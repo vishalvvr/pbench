@@ -20,6 +20,7 @@
 		"numastat": null,
 		"oc": null,
 		"openvswitch": null,
+		"pcp-transient": null,
 		"perf": null,
 		"pidstat": null,
 		"pprof": null,
@@ -37,8 +38,7 @@
 		"turbostat": null,
 		"user-tool": null,
 		"virsh-migrate": null,
-		"vmstat": null,
-		"pcp-transient": null
+		"vmstat": null
 	},
 
 	"persistent":{

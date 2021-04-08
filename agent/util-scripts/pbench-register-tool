@@ -100,10 +100,10 @@ function usage() {
 	printf -- "${script_name} --name=<tool-name> [--group=<group-name>]"
 	printf -- " [--no-install] [--persistent] [--transient]"
 	printf -- " [--remotes=<remote-host>[,<remote-host>]] [--labels=<label>[,<label>]]"
-	printf -- "  -- [all tool specific options here]\n"
+	printf -- " -- [all tool specific options here]\n"
 	printf -- "${script_name} --name=<tool-name> [--group=<group-name>]"
 	printf -- " [--no-install] [--persistent] [--transient] [--remotes=@<remotes-file>]"
-	printf -- "  -- [all tool specific options here]\n\n"
+	printf -- " -- [all tool specific options here]\n\n"
 	#             1         2         3         4         5         6         7         8
 	# (tab)    1 901234567890123456789012345678901234567890123456789012345678901234567890
 	printf -- "\tWhere the list of labels must match the list of remotes, one label per\n"
@@ -180,8 +180,8 @@ while true; do
 		shift
 		display_name=${name}
 		name=$(${pbench_bin}/util-scripts/get-internal-tool ${pbench_bin}/tool-scripts ${name} persistent)
-		if [[ ${name} == "" ]]; then
-			name="error"
+		if [[ -z "${name}" ]]; then
+			name="internal-tool-not-found"
 		fi
 		type="persistent"
 		;;
@@ -190,7 +190,7 @@ while true; do
 		display_name=${name}
 		name=$(${pbench_bin}/util-scripts/get-internal-tool ${pbench_bin}/tool-scripts ${name} transient)
 		if [[ ${name} == "" ]]; then
-			name="error"
+			name="internal-tool-not-found"
 		fi
 		type="transient"
 		;;
@@ -211,7 +211,7 @@ if [[ -z ${name} ]]; then
 	exit 1
 fi
 if [[ ! -x "${pbench_bin}/tool-scripts/${name}" ]]; then
-	if [[ ${name} == "error" && "${display_name}" != "" ]]; then
+	if [[ ${name} == "internal-tool-not-found" ]]; then
 		error_log "Could not find ${display_name} with type ${type} in ${pbench_bin}/tool-scripts/: has the right type been specified?"
 	else
 		error_log "Could not find ${name} in ${pbench_bin}/tool-scripts/: has this tool been integrated into the pbench-agent?"
@@ -434,10 +434,10 @@ function record_tool() {
 	else
 		_label_msg=""
 	fi
-	if [[ "${display_name}" != "" ]]; then
-		name=${display_name}
+	if [[ -z "${display_name}" ]]; then
+		display_name=${name}
 	fi
-	local _msg="\"${name}\" tool is now registered for host \"${remote_arg}\"${_label_msg} in group \"${group}\""
+	local _msg="\"${display_name}\" tool is now registered for host \"${remote_arg}\"${_label_msg} in group \"${group}\""
 	log "${_msg}"
 	printf "${_msg}\n"
 	return 0

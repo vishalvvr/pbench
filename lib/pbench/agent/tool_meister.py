@@ -328,7 +328,12 @@ class PcpTransTool(Tool):
         self.pmcd_process = None
         self.pmlogger_process = None
         if self.tool_dir:
-            self.tool_dir.mkdir()
+            try:
+                self.tool_dir.mkdir()
+            except Exception as exc:
+                self.logger.error(
+                    "Failed to create tool directory '%s': '%s'", self.tool_dir, exc
+                )
 
     def install(self):
         if self.pmcd_args is None:
@@ -393,13 +398,11 @@ class PcpTransTool(Tool):
         try:
             self.pmlogger_process.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            self.logger.error(
-                "pmlogger not properly terminated, still waiting after 20s"
-            )
+            self.logger.error("pmlogger not properly terminated after 20s")
         try:
             self.pmcd_process.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            self.logger.error("pmcd not properly terminated, still waiting after 20s")
+            self.logger.error("pmcd not properly terminated after 20s")
 
 
 class PersistentTool(Tool):
@@ -696,7 +699,8 @@ class ToolMeister:
     _valid_states = frozenset(["startup", "idle", "running", "shutdown"])
     _message_keys = frozenset(["action", "args", "directory", "group"])
     # Most tools we have today are "transient" tools, and are handled by external
-    # scripts.  Our two persistent tools are handled in the code directly.
+    # scripts.  Our three persistent tools (and pcp-transient) are handled in the
+    # code directly.
     #
     # FIXME - we should eventually allow them to be loaded externally.
     _tool_name_class_mappings = {
