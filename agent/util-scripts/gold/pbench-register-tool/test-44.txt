@@ -18,6 +18,7 @@ pbench-register-tool --name=<tool-name> [--group=<group-name>] [--no-install] [-
 	--persistent or --transient can be used to specify tool run type.
 
 Available tools:
+-Transient:
 	blktrace
 	bpftrace
 	cpuacct
@@ -57,6 +58,7 @@ Available tools:
 	user-tool
 	virsh-migrate
 	vmstat
+-Persistent:
 	node-exporter
 	dcgm
 	pcp
