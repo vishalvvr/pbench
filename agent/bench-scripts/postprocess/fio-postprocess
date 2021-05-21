@@ -248,6 +248,7 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 				$description_label = "Average submission latency per I/O operation";
 				$this_metric = \@slat;
 			}
+			my  = get_label('date_label')
 			my %last_ts = ( 0 => -1, 1 => -1 );
 			open(IN_FILE, "$dir/clients/$client_hostname_dir/$log_file") || die "$script: could not open file $dir/clients/$client_hostname_dir/$log_file $!\n";
 			while (<IN_FILE>) {
@@ -262,11 +263,11 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 					if ($timestamp_ms > $last_ts{$rwtype}) {
 						$last_ts{$rwtype} = $timestamp_ms
 					} else {
-						$index = value_exists(get_label('date_label'), $timestamp_ms, \@samples);
+						$index = value_exists($date_label, $timestamp_ms, \@samples);
 					}
 					if ($index == -1) {
 						%sample = (
-							get_label('date_label') => int $timestamp_ms,
+							$date_label => int $timestamp_ms,
 							'data' => { $rwtype => { 'values' => [ int $value ] } },
 							'type' => $log_type
 						);
@@ -281,14 +282,17 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 				}
 			}
 			close(IN_FILE);
+			$value_label = get_label('value_label')
 			for (my $i=0; $i < scalar @samples; $i++) {
-				$samples[$i]{get_label('value_label')} = 0;
+				$samples[$i]{$value_label} = 0;
 
 				foreach my $key (keys %{$samples[$i]{'data'}}) {
 					$samples[$i]{'data'}{$key}{'mean'} = 0;
 
 					if (scalar @{$samples[$i]{'data'}{$key}{'values'}} > 1) {
-						printf STDERR "[WARNING] %s/%s: timestamp %s for rwtype %d found multiple times, values [%s] will be averaged\n", $client_hostname_dir, $log_file, $samples[$i]{get_label('date_label')}, $key, join(', ', @{$samples[$i]{'data'}{$key}{'values'}});
+						printf STDERR "[WARNING] %s/%s: timestamp %s for rwtype %d found multiple times, values [%s] will be averaged\n",
+                            $client_hostname_dir, $log_file, $samples[$i]{$date_label}, $key,
+						    join(', ', @{$samples[$i]{'data'}{$key}{'values'}});
 					}
 
 					for (my $x=0; $x < scalar @{$samples[$i]{'data'}{$key}{'values'}}; $x++) {
@@ -297,11 +301,11 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 
 					$samples[$i]{'data'}{$key}{'mean'} /= scalar @{$samples[$i]{'data'}{$key}{'values'}};
 
-					$samples[$i]{get_label('value_label')} += $samples[$i]{'data'}{$key}{'mean'};
+					$samples[$i]{$value_label} += $samples[$i]{'data'}{$key}{'mean'};
 				}
 
 				if ($samples[$i]{'type'} =~ /lat$/) {
-					$samples[$i]{get_label('value_label')} /= scalar(keys(%{$samples[$i]{'data'}}));
+					$samples[$i]{$value_label} /= scalar(keys(%{$samples[$i]{'data'}}));
 				}
 
 				delete $samples[$i]{'type'};
