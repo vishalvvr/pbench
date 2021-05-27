@@ -15,7 +15,7 @@ use JSON;
 
 our @EXPORT_OK = qw(value_exists trim_series get_label create_uid get_length get_uid get_mean remove_timestamp get_timestamps write_influxdb_line_protocol get_cpubusy_series calc_ratio_series calc_sum_series div_series calc_aggregate_metrics calc_efficiency_metrics create_graph_hash get_json);
 
-my $script = "BenchPostprocess";
+my $script = "BenchPostprocess";  # FIXME:  this initialization doesn't seem to happen....
 
 # always use this for labels in the hashes for JSON data
 sub get_label {
@@ -130,16 +130,18 @@ sub get_uid {
 	return $mapped_uid;
 }
 
-# in a array of { 'date' => x, 'value' => y } hashes, return the average of all y's
+# Given a hash of { 'date' => x, 'value' => y } hashes,
+# return the average of all 'value's.
 sub get_mean {
-	my $array_ref = shift;
-	my $total = 0;
-	my $i;
-	for ($i=0; $i < scalar @{ $array_ref }; $i++) {
-		$total += $$array_ref[$i]{'value'};
+	my $hashref = shift;
+	my $sum = 0;
+	my $count;
+	foreach my $key (keys $hashref) {
+		$sum += $hashref->{$key}{'value'};
+		$count++;
 	}
-	if ( $i > 0 ) {
-		return $total / $i;
+	if ( $count > 0 ) {
+		return $sum / $count;
 	}
 }
 
@@ -387,57 +389,71 @@ sub calc_ratio_series {
 }
 
 sub calc_sum_series {
-	# This takes the sum of two hashes (hash references $add_from_ref and $add_to_ref)
-	# and stores the values in $add_to_ref.  This is essentially:
-	# %add_to_hash = %add_from_hash + %add_to_hash
+	# This function calculates the sum of two hashes (passed to hash
+	# references $add_from_ref and $add_to_ref) and stores the values in
+	# $add_to_ref.  This is essentially:
+	#
+	#     %add_to_hash = %add_from_hash + %add_to_hash
+	#
 	# Each hash is a time series, with a value for each timestamp key
-	# The timestamp keys do not need to match exactly.  Values are interrepted linearly
-	# These hashes need to be used by reference in order to preserve the changes made
-	my $params = shift;
-	my $add_from_ref = $params;
-	$params = shift;
-	my $add_to_ref = $params;
-	# This would be fairly trivial if the two hashes we are dealing with had the same keys (timestamps), but there
-	# is no guarantee of that.  What we have to do is key off the timestamps of the second hash (where we store the sum)
-	# and interpolate a value from the first hash.
-	my $count = 0;
-	my $prev_stat1_timestamp_ms = 0;
-	my @stat1_timestamps = get_timestamps(\@{$add_from_ref});
-	my @stat2_timestamps = get_timestamps(\@{$add_to_ref});
-	# remove any "leading" timestamps: timestamps from stat2 that come before first timestamp in stat1
-	while ($stat2_timestamps[0] and $stat1_timestamps[0] and $stat2_timestamps[0] < $stat1_timestamps[0]) {
-		my $unneeded_stat2_timestamp = shift(@stat2_timestamps);
-		remove_timestamp (\@{ $add_to_ref}, $unneeded_stat2_timestamp) || last;
+	# The timestamp keys do not need to match exactly:  linear interpolation
+	# is used to produce values from the addend which correspond to the
+	# timestamps in the sum.  (The hashes are passed by reference to allow the
+	# sum to be stored "in place".)
+	my $add_from_ref = shift;
+	my $add_to_ref = shift;
+
+	if (!(%$add_to_ref and %$add_from_ref)) {
+		return;
 	}
-	# remove any "trailing" timestamps: timestamps from stat2 that come after the last timestamp in stat1
-	while ($stat2_timestamps[-1] and $stat1_timestamps[-1] and $stat2_timestamps[-1] > $stat1_timestamps[-1]) {
-		my $unneeded_stat2_timestamp = pop(@stat2_timestamps);
-		remove_timestamp(\@{ $add_to_ref}, $unneeded_stat2_timestamp) || last;
-	}
-	if (scalar @stat1_timestamps) {
-		my $stat1_timestamp_ms = shift(@stat1_timestamps);
-		my $stat2_timestamp_ms;
-		for $stat2_timestamp_ms (@stat2_timestamps) {
-			# find a pair of consecutive stat1 timestamps which are before & after the stat2 timestamp
-			# these timestamps are ordered, so once the first stat1 timestamp is found that is >= stat2 timestamp,
-			# the previous stat1 timestamp should be < stat2 timestamp.
-			while ($stat1_timestamp_ms <= $stat2_timestamp_ms) {
-				$prev_stat1_timestamp_ms = $stat1_timestamp_ms;
-				$stat1_timestamp_ms = shift(@stat1_timestamps) || return;
-			}
-			my $stat1_value_base = get_value($add_from_ref, $prev_stat1_timestamp_ms);
-			# if the stat2 timestamp is different from the first $stat1 timestamp, then adjust the value based on the difference of time and values
-			my $stat2_prev_stat1_timestamp_diff_ms = ($stat2_timestamp_ms - $prev_stat1_timestamp_ms);
-			my $value_adj = 0;
-			if ($stat2_prev_stat1_timestamp_diff_ms != 0) {
-				my $stat1_prev_stat1_timestamp_diff_ms = ($stat1_timestamp_ms - $prev_stat1_timestamp_ms);
-				my $value_diff = get_value($add_from_ref, $stat1_timestamp_ms) - $stat1_value_base;
-				$value_adj = $value_diff * $stat2_prev_stat1_timestamp_diff_ms/$stat1_prev_stat1_timestamp_diff_ms;
-			}
-			my $stat1_value_interp = $stat1_value_base + $value_adj;
-			put_value($add_to_ref, $stat2_timestamp_ms,  get_value($add_to_ref,$stat2_timestamp_ms) + $stat1_value_interp);
-			$count++;
+
+	# Create "indexes" -- numerically ordered lists of timestamps -- for the two hashes.
+	my @sum_timestamps = sort {$a <=> $b} keys %$add_to_ref;
+	my @add_timestamps = sort {$a <=> $b} keys %$add_from_ref;
+
+	# For each timestamp in the sum, find a pair of timestamps in the addend
+	# which bracket it (where the second timestamp from the addend is greater
+	# than the timestamp from the sum and, therefore the first timestamp is
+	# less than or equal to the timestamp from the sum, since they are unique
+	# and in sorted order); perform a linear interpolation to produce a value
+	# from the addend corresponding to the timestamp from the sum and add it
+	# to the sum.  If the difference between the timestamp from the sum and
+	# the first timestamp from the addend is zero, then the interpolation,
+	# which would produce the same result, is skipped.
+	my $add_ts_1 = shift @add_timestamps;
+	my $add_ts_2 = shift @add_timestamps;
+	foreach my $sum_ts (@sum_timestamps) {
+		if ($add_ts_1 > $sum_ts) {
+			next;
 		}
+		while ($add_ts_2 <= $sum_ts) {
+			$add_ts_1 = $add_ts_2;
+			$add_ts_2 = shift @add_timestamps;
+			if (!defined($add_ts_2)) {
+				# We've hit the end of the addend:  if the first timestamp
+				# is a match, quit this loop and continue; otherwise return.
+				if ($add_ts_1 == $sum_ts) {
+					last;
+				}
+				else {
+					return;
+				}
+			}
+		}
+		if ($add_ts_1 > $sum_ts) {
+			die 'Logic bomb:  addend timestamp (${add_ts_1}) > sum timestamp (${sum_ts})';
+		}
+		my $value = $add_from_ref->{$add_ts_1}{'value'};
+		my $time_diff = $sum_ts - $add_ts_1;
+		if ($time_diff != 0 and defined($add_ts_2)) {
+			my $val_dif = $add_from_ref->{$add_ts_2}{'value'} - $value;
+			$value += $val_dif * $time_diff/($add_ts_2 - $add_ts_1);
+		}
+		$add_to_ref->{$sum_ts}{'value'} += $value;
+
+		# Note that $add_ts_2 might be undefined at this point, in which case
+		# we'll keep going until the check above notices and caused the
+		# function to return.  This kind of a hack but it's efficient.
 	}
 }
 
@@ -458,89 +474,88 @@ sub value_exists {
 }
 
 sub div_series {
-	my $params = shift;
-	my $div_from_ref = $params;
-	$params = shift;
-	my $divisor = $params;
-	if ( $divisor > 0 ) {
-	my $i;
-		for ($i=0; $i < scalar @{$div_from_ref}; $i++) {
-			$$div_from_ref[$i]{'value'} /= $divisor;
-		}
+	my $div_from_ref = shift;
+	my $divisor = shift;
+	if ( $divisor <= 0 ) {
+		return;
+	}
+	foreach my $key (keys %{$div_from_ref}) {
+		$div_from_ref->{$key}{'value'} /= $divisor;
 	}
 }
 
 sub calc_aggregate_metrics {
 	my $workload_ref = shift;
+	my $ts_label = get_label('timeseries_label');
 	# process any data in %workload{'throughput'|'latency'}, aggregating various per-client results
-	my $metric_class;
-	foreach $metric_class ('throughput', 'latency') {
+	foreach my $metric_class ('throughput', 'latency') {
 		if ($$workload_ref{$metric_class}) {
-			my $metric_type;
-			foreach $metric_type (keys %{ $$workload_ref{$metric_class} }) {
-				if (exists($$workload_ref{$metric_class}{$metric_type}[0]{get_label('skip_aggregate_label')})) {
-					next;
+			METRIC_TYPE: foreach my $metric_type_key (keys %{ $$workload_ref{$metric_class} }) {
+				my $metric_type = $$workload_ref{$metric_class}{$metric_type_key};
+				foreach my $metric (@$metric_type) {
+					if (exists($metric->{get_label('skip_aggregate_label')})) {
+						next METRIC_TYPE;
+					}
 				}
 
-				my %agg_dataset; # a new dataset for aggregated results
-				$agg_dataset{get_label('role_label')} = "aggregate";
-				$agg_dataset{get_label('description_label')} = $$workload_ref{$metric_class}{$metric_type}[0]{get_label('description_label')};
-				$agg_dataset{get_label('uid_label')} = $$workload_ref{$metric_class}{$metric_type}[0]{get_label('uid_label')};
-				foreach my $label ( grep { $_ ne get_label('description_label') and
-							   $_ ne get_label('value_label') and
-							   $_ ne get_label('uid_label') and
-							   $_ ne get_label('timeseries_label') and
-							   $_ ne get_label('role_label') } (keys %{ $$workload_ref{$metric_class}{$metric_type}[0] } ) ) {
-					$agg_dataset{$label} = "all";
-				}
 				# Ensure we have at least 1 good series
 				my $num_ts = 0;
 				my $num_metrics = 0;
-				my $skip_metric = 0;
-				for (my $i = 0; $i < scalar @{ $$workload_ref{$metric_class}{$metric_type} }; $i++) {
-					if (exists($$workload_ref{$metric_class}{$metric_type}[$i]{get_label('skip_aggregate_label')})) {
-						$skip_metric = 1
-					}
-
+				foreach my $metric (@$metric_type) {
 					# A timeseries is considered valid if it has at least 2 timestamps
-					if ((defined $$workload_ref{$metric_class}{$metric_type}[$i]{get_label('timeseries_label')}) and
-					    (scalar get_timestamps(\@{ $$workload_ref{$metric_class}{$metric_type}[$i]{get_label('timeseries_label')}}) > 1)) {
-						# FIXME - Why are we calling get_timestamps(), which creates, sorts, and returns a new array only to throw it away?
+					if ((defined $metric->{$ts_label}) and
+					    ((scalar keys $metric->{$ts_label}) > 1)) {
 						$num_ts++;
 					}
 					$num_metrics++;
 				}
-				if (($num_metrics == 0) || ($skip_metric == 1)) {
-					next;
+				if ($num_metrics == 0) {
+					next METRIC_TYPE;
 				}
-				# In order to create an aggregate timeseries, we need at least 1 time series and all metrics must have timeseries data
+
+				my $first_metric_type = $metric_type->[0];
+				my %agg_dataset; # a new dataset for aggregated results
+				$agg_dataset{get_label('role_label')} = "aggregate";
+				$agg_dataset{get_label('description_label')} = $first_metric_type->{get_label('description_label')};
+				$agg_dataset{get_label('uid_label')} = $first_metric_type->{get_label('uid_label')};
+				foreach my $label ( grep { $_ ne get_label('description_label') and
+							   $_ ne get_label('value_label') and
+							   $_ ne get_label('uid_label') and
+							   $_ ne $ts_label and
+							   $_ ne get_label('role_label') } (keys %{ $first_metric_type } ) ) {
+					$agg_dataset{$label} = "all";
+				}
+
+				# In order to create an aggregate timeseries, we need at least
+				# one time series, and all metrics must have timeseries data.
 				if ( $num_ts > 0 and $num_metrics == $num_ts ) {
-					# The aggregate is initialized with the first series
-					my @agg_series;
-					my $first_series;
-					foreach $first_series ( @{ $$workload_ref{$metric_class}{$metric_type}[0]{get_label('timeseries_label')} }  ) {
-						my %sample = ( get_label('date_label') => int $$first_series{ get_label('date_label') }, get_label('value_label') => $$first_series{ get_label('value_label') } );
-						push(@agg_series, \%sample);
+					# The aggregate is initialized with a copy of the first series
+					my %agg_series;
+					foreach my $ts ( keys %{ $first_metric_type->{$ts_label} } ) {
+						$agg_series{$ts} = {(%{$first_metric_type->{$ts_label}{$ts}})};
 					}
 
 					# And if more series exist, they are added to the aggregate series
-					if ( $num_ts > 0) {
+					if ( $num_ts > 0 ) {
 						my $i;
-						for ($i=1; $i < scalar @{ $$workload_ref{$metric_class}{$metric_type} }; $i++) {
-							calc_sum_series(\@{ $$workload_ref{$metric_class}{$metric_type}[$i]{get_label('timeseries_label')} }, \@agg_series);
+						for ($i=1; $i < scalar @{ $metric_type }; $i++) {
+							my $hashref = $metric_type->[$i]{$ts_label};
+							calc_sum_series($hashref, \%agg_series);
 						}
 						if ( $metric_class eq 'latency' ) {
-							div_series(\@agg_series, $i);
+							div_series(\%agg_series, $i);
 						}
 					}
-					$agg_dataset{get_label('value_label')} = get_mean(\@agg_series);
-					$agg_dataset{get_label('timeseries_label')} = \@agg_series;
-				# If creating a new timeseries is not possible, the aggregate metric is constructed from the "value_label' from each metric instead.
+					$agg_dataset{get_label('value_label')} = get_mean(\%agg_series);
+					$agg_dataset{get_label('timeseries_label')} = \%agg_series;
 				} else {
+					# Since creating a new time-series is not possible, the
+					# aggregate metric is constructed from the "value_label'
+					# from each metric instead.
 					my $i;
 					my $value = 0;
-					for ($i = 0; $i < scalar @{ $$workload_ref{$metric_class}{$metric_type} }; $i++) {
-						$value += $$workload_ref{$metric_class}{$metric_type}[$i]{get_label('value_label')}
+					for ($i = 0; $i < scalar @{ $metric_type }; $i++) {
+						$value += $metric_type->[$i]{get_label('value_label')}
 					}
 					if ( $metric_class eq 'latency' ) {
 						$value /= $i;
@@ -548,7 +563,7 @@ sub calc_aggregate_metrics {
 					$agg_dataset{get_label('value_label')} = $value;
 				}
 				# The aggregate data should be the first in the array
-				unshift(@{ $$workload_ref{$metric_class}{$metric_type} }, \%agg_dataset);
+				unshift(@$metric_type, \%agg_dataset);
 			}
 		}
 	}
@@ -596,17 +611,15 @@ sub create_graph_hash {
 	foreach my $metric_type ('throughput', 'latency', 'resource', 'efficiency') {
 		if ($$workload_ref{$metric_type}) {
 			foreach my $metric_name (keys %{ $$workload_ref{$metric_type} }) {
-				for (my $i = 0; $i < scalar @{ $$workload_ref{$metric_type}{$metric_name} }; $i++) {
-					my $series_name = get_uid($$workload_ref{$metric_type}{$metric_name}[$i]{get_label('uid_label')}, \%{ $$workload_ref{$metric_type}{$metric_name}[$i] });
-					if (exists($$workload_ref{$metric_type}{$metric_name}[$i]{get_label('timeseries_label')})) {
-						for (my $j = 0; $j < scalar @{ $$workload_ref{$metric_type}{$metric_name}[$i]{get_label('timeseries_label')} }; $j++ ) {
-							my $timestamp_ms = $$workload_ref{$metric_type}{$metric_name}[$i]{get_label('timeseries_label')}[$j]{get_label('date_label')};
-							if ($timestamp_ms) {
-								my $value = $$workload_ref{$metric_type}{$metric_name}[$i]{get_label('timeseries_label')}[$j]{get_label('value_label')};
-								my $graph_name = $metric_name;
-								$graph_name =~ s/\//_per_/g;
-								$$graph_ref{$html_name}{$graph_name}{$series_name}{$timestamp_ms} = $value;
-							}
+				my $series_list = $workload_ref->{$metric_type}{$metric_name};
+				foreach my $series (@$series_list) {
+					my $series_name = get_uid($series->{get_label('uid_label')}, \%{ $series });
+					if (exists($series->{get_label('timeseries_label')})) {
+						foreach my $ts (keys $series->{get_label('timeseries_label')}) {
+							my $value = $series->{get_label('timeseries_label')}{$ts}{get_label('value_label')};
+							my $graph_name = $metric_name;
+							$graph_name =~ s/\//_per_/g;
+							$$graph_ref{$html_name}{$graph_name}{$series_name}{$ts} = $value;
 						}
 					}
 				}
@@ -615,4 +628,3 @@ sub create_graph_hash {
 	}
 }
 
-1;
