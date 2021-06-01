@@ -7,7 +7,10 @@ use lib $ENV{'pbench_lib_dir'};
 use lib $ENV{'pbench_bspp_dir'};
 no lib ".";
 use GenData qw(gen_data);
-use BenchPostprocess qw(calc_aggregate_metrics calc_efficiency_metrics create_graph_hash create_uid get_cpubusy_series get_json get_label get_mean trim_series value_exists);
+use BenchPostprocess qw(
+	calc_aggregate_metrics calc_efficiency_metrics create_graph_hash
+	convert_samples_hash_to_array create_uid get_cpubusy_series get_json
+	get_label get_mean get_mean_hash);
 use File::Basename;
 use Data::Dumper;
 use List::Util('sum');
@@ -25,16 +28,9 @@ my $script = basename($0);
 my $dir = $ARGV[0];
 my $tool_label_pattern = $ARGV[1];
 my $tool_group = $ARGV[2];
-# my $benchmark_version = $ARGV[6];
+my $benchmark_version = $ARGV[6];  # FIXME:  Not used (unlike in trafficgen and uperf).
 my $benchmark_name = 'fio';
-# my %fio_sample;
-# my $timestamp_ms = 0;
-# my $prev_timestamp_ms = 0;
-# my $timestamp_ms_diff;
 my $line;
-# my %avg;
-# my %total;
-# my $series_trim = 0;
 my $primary_metric="iops_sec";
 
 
@@ -80,9 +76,9 @@ my @iops_sec;	# each array element contains a hash with:
 		# timeseries: a hash of timstamp:value key-pair
 
 
-# Get the tool data
-# Define a set of tool directories which we want to use to report CPU and efficiency metrics
-# Search for tool directories which match the $tool_label_pattern
+# Get the tool data; define a set of tool directories which we want to use to
+# report CPU and efficiency metrics; search for tool directories which match
+# the $tool_label_pattern.
 my $this_tool_dir;
 my %tool_ids;
 my $tool_group_dir = "$dir/tools-$tool_group";
@@ -105,7 +101,6 @@ foreach $this_tool_dir (sort keys %tool_ids) {
 	my $res;
 	my $this_tool_id = $tool_ids{$this_tool_dir};
 	my $role = "host";
-	# my $url;
 	my $hostname;
 	($role, $hostname) = split(/:/,$this_tool_id);
 	my @cpubusy_samples;
@@ -114,7 +109,14 @@ foreach $this_tool_dir (sort keys %tool_ids) {
 		my %this_cpubusy_dataset;
 		my $description = "Total busy CPU usage, averaged over N seconds, where 1.0 = 1 logical CPU";
 		my $mean = get_mean(\@cpubusy_samples);
-		%this_cpubusy_dataset = ( get_label('uid_label') => create_uid('hostname_label'), get_label('description_label') => $description, get_label('role_label') => $role, get_label('hostname_label') => $hostname, get_label('value_label') => $mean, get_label('timeseries_label') => \@cpubusy_samples );
+		%this_cpubusy_dataset = (
+			get_label('uid_label')         => create_uid('hostname_label'),
+			get_label('description_label') => $description,
+			get_label('role_label')        => $role,
+			get_label('hostname_label')    => $hostname,
+			get_label('value_label')       => $mean,
+			get_label('timeseries_label')  => \@cpubusy_samples
+		);
 		push(@cpu_busy, \%this_cpubusy_dataset);
 	}
 }
@@ -132,14 +134,12 @@ if ($fio_results_scalar == 0) {
 	die "$script: Failed to read valid JSON from $fio_results_path!\n";
 }
 my %fio_results = %$fio_results_scalar;
-# my $job_num = 1;
-# my $num_jobs = 1;
 
 # There are two areas to get benchmark parameters for fio:
-# -global options: these are the options usually populated in the top of a fio-job file,
-#  or given on cmdline
-# -per-job options: there are the options usually populated in the per-job section
-#  of a fio-job file
+#  - global options:  these are the options usually populated in the top of a
+#    fio-job file, or given on command line;
+#  - per-job options:  there are the options usually populated in the per-job
+#    section of a fio-job file.
 
 for my $param (keys (%{ $fio_results{"global options"} })) {
 	if (not $param =~/^write_\w+_log$/) {
@@ -161,12 +161,12 @@ if ($fio_results{"jobs"}) {
 	$jobs_stats = \$fio_results{"jobs"}; # when not using --clients
 }
 
-# The remaining benchmark parameters, if any, come from the fio-job-specific options.
-# The values for these parameters are concatenated with commas into a single value and assigned
-# to a single benchmark parameter.  For example, "rw=read,read" for 2 jobs.
-# my $total_jobs=0;
+# The remaining benchmark parameters, if any, come from the fio-job-specific
+# options.  The values for these parameters are concatenated with commas into
+# a single value and assigned to a single benchmark parameter.  For example,
+# "rw=read,read" for 2 jobs.
 if (defined $jobs_stats) {
-	# first, we build a set of all per-job options we can find across all jobs
+	# First, we build a set of all per-job options we can find across all jobs
 	my %all_job_params;
 	for my $job (@{ $$jobs_stats }) {
 		if (defined $$job{"job options"}) {
@@ -175,8 +175,8 @@ if (defined $jobs_stats) {
 			}
 		}
 	}
-	# now we can search all jobs for all params, and if some are not present, insert ",," in our
-	# ordered list of per-job parameters
+	# Now we can search all jobs for all params, and if some are not present,
+	# insert ",," in our ordered list of per-job parameters.
 	for my $job (@{ $$jobs_stats }) {
 		if (defined $$job{"job options"}) {
 			for my $job_param (keys %all_job_params) {
@@ -229,9 +229,7 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 		if ( $log_file =~ /^fio_(iops|lat|slat|clat)\.(\d+)\.log$/) {
 			my $log_type = $1;
 			my $job_id = $2;
-			# my $date_base = 1471365291000;
 			my $role = "client";
-			# my $average;
 			my %samples;
 			my $description_label;
 			my $this_metric;
@@ -258,13 +256,7 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 					my $value = $2;
 					my $rwtype = $3;
 					if (exists($samples{$timestamp_ms})) {
-						# if (exists($samples{$timestamp_ms}{'data'}{$rwtype})) {
-						# 	push(@{$samples{$timestamp_ms}{'data'}{$rwtype}{'values'}}, int $value);
-						# } else {
-						# 	$samples{$timestamp_ms}{'data'}{$rwtype} = { 'values' => [ int $value ] };
-						# }
-						#
-						# Behold autovivification!
+						# Behold, autovivification!
                         push(@{$samples{$timestamp_ms}{'data'}{$rwtype}{'values'}}, int $value);
 					} else {
 						$samples{$timestamp_ms} = {
@@ -283,15 +275,11 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 
 				foreach my $key (keys %{$sample->{'data'}}) {
 				    my $sample_data = $sample->{'data'}{$key};
-					$sample_data->{'mean'} = 0;
-
 					if (scalar @{$sample_data->{'values'}} > 1) {
 						printf STDERR "[WARNING] %s/%s: timestamp %s for rwtype %d found multiple times, values [%s] will be averaged\n",
                             $client_hostname_dir, $log_file, $sample->{$date_label}, $key,
 						    join(', ', @{$sample_data->{'values'}});
 					}
-
-
 					$sample->{$value_label} += mean(@{$sample_data->{'values'}});
 				}
 
@@ -304,29 +292,14 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 			}
 			$nr_log_files++;
 			if ( scalar %samples ) {
-				# FIXME:  samples is now a hash, but trim_series() wants an array
-				#         so, if we want to be able to trim the series, we need
-				#         to write a new function (the existing one is also
-				#         referenced by uperf and trafficgen).
-				# trim_series(\@samples, $series_trim, $series_trim);
-				my %this_dataset;
-				# my $mean = get_mean(\@samples);
-				my $mean = 0;
-				my $count = 0;
-				foreach my $value (values(%samples)) {
-				    $mean += $value->{$value_label};
-				    $count += 1;
-				}
-				$mean /= $count;
-				%this_dataset = (
-				 	get_label('role_label') => $role,
+				push(@$this_metric, {
+					get_label('role_label')            => $role,
 					get_label('client_hostname_label') => $client_hostname_dir . "-" . $job_id,
-					get_label('value_label') => $mean,
-					get_label('timeseries_label') => \%samples,  # FIXME: are we expecting an array here??
-					get_label('uid_label') => create_uid('client_hostname_label')
-				);
-				$this_dataset{get_label('description_label')} = $description_label;  # FIXME:  combine with previous statement??
-				push(@$this_metric, \%this_dataset);
+					get_label('value_label')           => get_mean_hash(\%samples),
+					get_label('timeseries_label')      => \%samples,
+					get_label('uid_label')             => create_uid('client_hostname_label'),
+					get_label('description_label')     => $description_label
+				});
 			}
 		}
 	}
@@ -397,6 +370,8 @@ my %graph_threshold;
 my %graph_type;
 print STDERR "gen_data\n";
 gen_data(\%graph, \%graph_type, \%graph_threshold, $dir, 1);
+
+convert_samples_hash_to_array(\%workload);
 
 # write to JSON format file
 my $json_file = $dir . "/result.json";

@@ -13,7 +13,11 @@ use Exporter qw(import);
 use List::Util qw(max);
 use JSON;
 
-our @EXPORT_OK = qw(value_exists trim_series get_label create_uid get_length get_uid get_mean remove_timestamp get_timestamps write_influxdb_line_protocol get_cpubusy_series calc_ratio_series calc_sum_series div_series calc_aggregate_metrics calc_efficiency_metrics create_graph_hash get_json);
+our @EXPORT_OK = qw(
+	calc_aggregate_metrics calc_efficiency_metrics calc_ratio_series
+	calc_sum_series convert_samples_hash_to_array create_graph_hash
+	create_uid get_cpubusy_series get_json get_label get_length get_mean
+	get_mean_hash get_uid trim_series);
 
 my $script = "BenchPostprocess";  # FIXME:  this initialization doesn't seem to happen....
 
@@ -132,20 +136,36 @@ sub get_uid {
 
 # Given a hash of { 'date' => x, 'value' => y } hashes,
 # return the average of all 'value's.
-sub get_mean {
+sub get_mean_hash {
 	my $hashref = shift;
 	my $sum = 0;
-	my $count;
-	foreach my $key (keys $hashref) {
+	my $count = 0;
+	foreach my $key (keys %$hashref) {
 		$sum += $hashref->{$key}{'value'};
 		$count++;
 	}
 	if ( $count > 0 ) {
 		return $sum / $count;
 	}
+	die "No count for get_mean_hash.";
 }
 
-# in a array of { 'date' => x, 'value' => y } hashes, find the hash which $timestamp matches x and then return y
+# Given an array of { 'date' => x, 'value' => y } hashes,
+# return the average of all 'value's.
+sub get_mean {
+      my $array_ref = shift;
+      my $total = 0;
+      my $i;
+      for ($i=0; $i < scalar @{ $array_ref }; $i++) {
+              $total += $$array_ref[$i]{'value'};
+      }
+      if ( $i > 0 ) {
+              return $total / $i;
+      }
+}
+
+# In an array of { 'date' => x, 'value' => y } hashes, find the hash in which
+# $timestamp matches x and then return y
 sub get_value {
 	my $array_ref = shift;
 	my $timestamp = shift;
@@ -157,8 +177,8 @@ sub get_value {
 	}
 }
 
-# in a array of { 'date' => x, 'value' => y } hashes, either find the hash which $timestamp matches x and update y, or
-# if there is no hash which $timestamp matches x, add a new hash
+# In an array of { 'date' => x, 'value' => y } hashes, either find the hash in
+# which $timestamp matches x and update y, or add a new hash
 sub put_value {
 	my $array_ref = shift;
 	my $timestamp = shift;
@@ -174,7 +194,8 @@ sub put_value {
 	push(@{ $array_ref }, \%timestamp_value);
 }
 
-# in a array of { 'date' => x, 'value' => y } hashes, find the hash which $timestamp matchs x and then remove that hash from the array
+# In an array of { 'date' => x, 'value' => y } hashes, find the hash in which
+# $timestamp matches x and then remove that hash from the array
 sub remove_timestamp {
 	my $array_ref = shift;
 	my $timestamp = shift;
@@ -189,7 +210,8 @@ sub remove_timestamp {
 	return $found;
 }
 
-# in a array of { 'date' => x, 'value' => y } hashes, return an array of only timestamps
+# Given an array of { 'date' => x, 'value' => y } hashes, return an array of
+# only timestamps
 sub get_timestamps {
 	my @timestamps;
 	my $array_ref = shift;
@@ -228,36 +250,6 @@ sub trim_series {
 	}
 }
 
-sub write_influxdb_line_protocol {
-	my $params = shift;
-	# the name of the measurement, like resource_cpu_busy or benchmark_throughput_Gb_sec
-	my $measurement = $params;
-	# the directory to write this file
-	$params = shift;
-	my $dir = $params;
-	$params = shift;
-	# These hash, which will be populated with cpubusy data, needs to be used by reference in order to preserve the changes made
-	my $data_ref = $params;
-	my $file_name = $dir . "/" . $measurement . ".txt";
-	if (open(INFLUXDB, ">>$file_name")) {
-		my $timestamp;
-		foreach $timestamp (keys %{ $$data_ref{get_label('timeseries_label')} } ) {
-			my $this_key;
-			my $id_string = $measurement;
-			foreach $this_key (keys %{ $data_ref}) {
-				if ( $this_key ne get_label('timeseries_label') && $this_key ne "uid" && $this_key ne "value" && $this_key ne "description" && $$data_ref{$this_key}) {
-					my $value = $$data_ref{$this_key};
-					$value =~ s/\s/\\ /g;
-					$id_string = $id_string . "," . $this_key . "=" . $value;
-				}
-			}
-		my $timestamp_ns = $timestamp * 1000000;
-		my $value = $$data_ref{get_label('timeseries_label')}{$timestamp};
-		printf INFLUXDB "%s value=%f %d\n", $id_string, $value, $timestamp_ns;
-		}
-		close(INFLUXDB);
-	}
-}
 sub get_cpubusy_series {
 	# This will get a hash (series) with keys = timestamps and values = CPU busy
 	# CPU Busy is in CPU units: 1.0 = amoutn of cpu used is equal to 1 logical CPU
@@ -457,22 +449,6 @@ sub calc_sum_series {
 	}
 }
 
-sub value_exists {
-	my $params = shift;
-	my $key = $params;
-	$params = shift;
-	my $value = $params;
-	$params = shift;
-	my $array_ref = $params;
-	my $i;
-	for ($i=0; $i < scalar @{$array_ref}; $i++) {
-		if ($$array_ref[$i]{$key} == $value) {
-			return $i;
-		}
-	}
-	return -1;
-}
-
 sub div_series {
 	my $div_from_ref = shift;
 	my $divisor = shift;
@@ -546,7 +522,7 @@ sub calc_aggregate_metrics {
 							div_series(\%agg_series, $i);
 						}
 					}
-					$agg_dataset{get_label('value_label')} = get_mean(\%agg_series);
+					$agg_dataset{get_label('value_label')} = get_mean_hash(\%agg_series);
 					$agg_dataset{get_label('timeseries_label')} = \%agg_series;
 				} else {
 					# Since creating a new time-series is not possible, the
@@ -628,3 +604,24 @@ sub create_graph_hash {
 	}
 }
 
+# Given a workload hash, find all the timeseries hashes and replace them with
+# arrays.
+sub convert_samples_hash_to_array {
+	my $workload_ref = shift;
+	foreach my $metric_type (keys %$workload_ref) {
+		if ($$workload_ref{$metric_type}) {
+			foreach my $metric_name (keys %{ $$workload_ref{$metric_type} }) {
+				my $series_list = $workload_ref->{$metric_type}{$metric_name};
+				foreach my $series (@$series_list) {
+					if (exists($series->{get_label('timeseries_label')})) {
+						my @ts_array;
+						foreach my $ts (sort { $a <=> $b } keys $series->{get_label('timeseries_label')}) {
+							push(@ts_array, $series->{get_label('timeseries_label')}{$ts});
+						}
+						$series->{get_label('timeseries_label')} = \@ts_array;
+					}
+				}
+			}
+		}
+	}
+}
