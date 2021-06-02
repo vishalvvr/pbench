@@ -134,6 +134,20 @@ sub get_uid {
 	return $mapped_uid;
 }
 
+# Given an array of { 'date' => x, 'value' => y } hashes,
+# return the average of all 'value's.
+sub get_mean {
+      my $array_ref = shift;
+      my $total = 0;
+      my $i;
+      for ($i=0; $i < scalar @{ $array_ref }; $i++) {
+              $total += $$array_ref[$i]{'value'};
+      }
+      if ( $i > 0 ) {
+              return $total / $i;
+      }
+}
+
 # Given a hash of { 'date' => x, 'value' => y } hashes,
 # return the average of all 'value's.
 sub get_mean_hash {
@@ -148,20 +162,6 @@ sub get_mean_hash {
 		return $sum / $count;
 	}
 	die "No count for get_mean_hash.";
-}
-
-# Given an array of { 'date' => x, 'value' => y } hashes,
-# return the average of all 'value's.
-sub get_mean {
-      my $array_ref = shift;
-      my $total = 0;
-      my $i;
-      for ($i=0; $i < scalar @{ $array_ref }; $i++) {
-              $total += $$array_ref[$i]{'value'};
-      }
-      if ( $i > 0 ) {
-              return $total / $i;
-      }
 }
 
 # In an array of { 'date' => x, 'value' => y } hashes, find the hash in which
@@ -480,15 +480,15 @@ sub calc_aggregate_metrics {
 					$agg_dataset{get_label('timeseries_label')} = \%agg_series;
 				} else {
 					# Since creating a new time-series is not possible, the
-					# aggregate metric is constructed from the "value_label'
+					# aggregate metric is constructed from the "value_label"
 					# from each metric instead.
-					my $i;
+					my $count;
 					my $value = 0;
-					for ($i = 0; $i < scalar @{ $metric_type }; $i++) {
-						$value += $metric_type->[$i]{get_label('value_label')}
+					for ($count = 0; $count < scalar @{ $metric_type }; $count++) {
+						$value += $metric_type->[$count]{get_label('value_label')}
 					}
 					if ( $metric_class eq 'latency' ) {
-						$value /= $i;
+						$value /= $count;
 					}
 					$agg_dataset{get_label('value_label')} = $value;
 				}
