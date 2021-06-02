@@ -10,7 +10,7 @@ use GenData qw(gen_data);
 use BenchPostprocess qw(
 	calc_aggregate_metrics calc_efficiency_metrics create_graph_hash
 	convert_samples_hash_to_array create_uid get_cpubusy_series get_json
-	get_label get_mean get_mean_hash);
+	get_label get_mean_hash);
 use File::Basename;
 use Data::Dumper;
 use List::Util('sum');
