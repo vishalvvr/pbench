@@ -17,7 +17,7 @@ our @EXPORT_OK = qw(
 	calc_aggregate_metrics calc_efficiency_metrics calc_ratio_series
 	calc_sum_series convert_samples_hash_to_array create_graph_hash
 	create_uid get_cpubusy_series get_json get_label get_length get_mean
-	get_mean_hash get_uid trim_series);
+	get_mean_hash get_uid);
 
 my $script = "BenchPostprocess";  # FIXME:  this initialization doesn't seem to happen....
 
@@ -220,34 +220,6 @@ sub get_timestamps {
 		push(@timestamps, $$timestamp_value_ref{'date'});
 	}
 	return @timestamps = sort {$a<=>$b} @timestamps;
-}
-
-sub trim_series {
-	my $array_ref = shift;
-	my $begin_trim = shift;
-	my $end_trim = shift;
-	my @timestamps = get_timestamps($array_ref);
-	my $timestamp;
-
-	if ( $begin_trim > 0 and scalar @timestamps) {
-		my $first_timestamp = shift(@timestamps);
-		$timestamp = $first_timestamp;
-		while ( ($timestamp - $first_timestamp) <= ($begin_trim * 1000) and remove_timestamp($array_ref, $timestamp)) {
-			if (scalar @timestamps) {
-				$timestamp = shift(@timestamps);
-			}
-		}
-	}
-
-	if ( $end_trim > 0 and scalar @timestamps) {
-		my $last_timestamp = pop(@timestamps);
-		$timestamp = $last_timestamp;
-		while ( ($last_timestamp - $timestamp) <= ($end_trim * 1000) and remove_timestamp($array_ref, $timestamp)) {
-			if (scalar @timestamps) {
-				$timestamp = pop(@timestamps);
-			}
-		}
-	}
 }
 
 # Produce a hash of timeseries data for CPU utilization, where 1.0 is
