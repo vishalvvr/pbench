@@ -98,24 +98,23 @@ if (opendir($dh, $tool_group_dir)) {
 }
 
 foreach $this_tool_dir (sort keys %tool_ids) {
-	my $res;
 	my $this_tool_id = $tool_ids{$this_tool_dir};
 	my $role = "host";
 	my $hostname;
 	($role, $hostname) = split(/:/,$this_tool_id);
-	my @cpubusy_samples;
-	$res = get_cpubusy_series($this_tool_dir, \@cpubusy_samples );
+	my %cpubusy_samples;
+	my $res = get_cpubusy_series($this_tool_dir, \%cpubusy_samples );
 	if ( $res == 0 ) {
 		my %this_cpubusy_dataset;
 		my $description = "Total busy CPU usage, averaged over N seconds, where 1.0 = 1 logical CPU";
-		my $mean = get_mean(\@cpubusy_samples);
+		my $mean = get_mean_hash(\%cpubusy_samples);
 		%this_cpubusy_dataset = (
 			get_label('uid_label')         => create_uid('hostname_label'),
 			get_label('description_label') => $description,
 			get_label('role_label')        => $role,
 			get_label('hostname_label')    => $hostname,
 			get_label('value_label')       => $mean,
-			get_label('timeseries_label')  => \@cpubusy_samples
+			get_label('timeseries_label')  => \%cpubusy_samples
 		);
 		push(@cpu_busy, \%this_cpubusy_dataset);
 	}
@@ -269,7 +268,7 @@ foreach $client_hostname_dir (@client_hostname_dirs) {
 			}
 			close(IN_FILE);
 			my $value_label = get_label('value_label');
-			foreach my $i (sort {$a <=> $b} keys %samples) {
+			foreach my $i (keys %samples) {
 			    my $sample = $samples{$i};
 				$sample->{$value_label} = 0;
 

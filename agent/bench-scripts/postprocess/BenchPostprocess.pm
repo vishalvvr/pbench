@@ -10,7 +10,7 @@ use warnings;
 use File::Basename;
 use Cwd 'abs_path';
 use Exporter qw(import);
-use List::Util qw(max);
+use List::Util qw(max sum);
 use JSON;
 
 our @EXPORT_OK = qw(
@@ -250,30 +250,15 @@ sub trim_series {
 	}
 }
 
+# Produce a hash of timeseries data for CPU utilization, where 1.0 is
+# equivalent to 1 logical CPU (1.0 does not necessarily mean exactly one of
+# the cpus was used at 100%, rather this value is a sum of the respective
+# utilizations of all cpus used).
 sub get_cpubusy_series {
-	# This will get a hash (series) with keys = timestamps and values = CPU busy
-	# CPU Busy is in CPU units: 1.0 = amoutn of cpu used is equal to 1 logical CPU
-	# 1.0 does not necessarily mean exactly 1 of the cpus was used at 100%.
-	# This value is a sum of all cpus used, which may be several cpus used, each a fraction of their maximum
-
-	my $first_timestamp;
-	my $last_timestamp;
-	my $params = shift;
-	# This is the directory which contains the tool data: see ./sar/csv/cpu_all_cpu_busy.csv
-	my $tool_dir = $params;
-	$params = shift;
-	# These hash, which will be populated with cpubusy data, needs to be used by reference in order to preserve the changes made
-	my $cpu_busy_ref = $params;
-	$params = shift;
-	if ($params) {
-		# We don't want data before this timestamp
-		$first_timestamp = $params;
-		$params = shift;
-		if ($params) {
-			# We don't want data after this timestamp
-			$last_timestamp = $params;
-		}
-	}
+	my $tool_dir = shift;         # Directory containing input file
+	my $cpu_busy_ref = shift;     # Reference to hash to hold the output
+	my $first_timestamp = shift;  # We don't want data before this timestamp
+	my $last_timestamp = shift;   # We don't want data after this timestamp
 	my $file = "$tool_dir/sar/csv/cpu_all_cpu_busy.csv";
 	if (open(SAR_ALLCPU_CSV, "$file")) {
 		my $timestamp_ms = 0;
@@ -291,27 +276,24 @@ sub get_cpubusy_series {
 			}
 			@values = split(/,/,$line);
 			$timestamp_ms = shift(@values);
-			if ((!$last_timestamp || $timestamp_ms <= $last_timestamp ) && ( !$first_timestamp || $timestamp_ms >= $first_timestamp )) {
-				my $value;
-				$cpu_busy = 0;
-				foreach $value (@values) {
-					$cpu_busy += $value;
-				}
-				push(@$cpu_busy_ref, { 'date' => int $timestamp_ms, 'value' => $cpu_busy/100});
-				$cnt++;
+			if ($first_timestamp && $timestamp_ms < $first_timestamp) {
+				next;
 			}
+			if ($last_timestamp && $timestamp_ms > $last_timestamp) {
+				last;
+			}
+			$cpu_busy_ref->{$timestamp_ms} = { 'date' => int $timestamp_ms, 'value' => sum(@values)/100 };
+			$cnt++;
 		}
 		close(SAR_ALLCPU_CSV);
 		if ($cnt > 0) {
 			return 0;
-		} else {
-			printf "$script: no sar timestamps in $file fall within given range: $first_timestamp - $last_timestamp\n";
-			return 1;
 		}
+		printf STDERR "$script: no sar timestamps in $file fall within given range: $first_timestamp - $last_timestamp\n";
 	} else {
-		printf "$script: could not find file $file\n";
-		return 1;
+		printf STDERR "$script: could not find file $file\n";
 	}
+	return 1;
 }
 
 sub calc_ratio_series {
