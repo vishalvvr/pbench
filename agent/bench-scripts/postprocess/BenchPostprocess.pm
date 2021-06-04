@@ -164,64 +164,6 @@ sub get_mean_hash {
 	die "No count for get_mean_hash.";
 }
 
-# In an array of { 'date' => x, 'value' => y } hashes, find the hash in which
-# $timestamp matches x and then return y
-sub get_value {
-	my $array_ref = shift;
-	my $timestamp = shift;
-	my $timestamp_value_ref;
-	foreach $timestamp_value_ref (@{ $array_ref }) {
-		if ( $$timestamp_value_ref{'date'} == $timestamp ) {
-			return $$timestamp_value_ref{'value'};
-		}
-	}
-}
-
-# In an array of { 'date' => x, 'value' => y } hashes, either find the hash in
-# which $timestamp matches x and update y, or add a new hash
-sub put_value {
-	my $array_ref = shift;
-	my $timestamp = shift;
-	my $value = shift;
-	my $timestamp_value_ref;
-	foreach $timestamp_value_ref (@{ $array_ref }) {
-		if ( $$timestamp_value_ref{'date'} == $timestamp ) {
-			$$timestamp_value_ref{'value'} = $value;
-			return;
-		}
-	}
-	my %timestamp_value = ('date' => $timestamp, 'value' => $value);
-	push(@{ $array_ref }, \%timestamp_value);
-}
-
-# In an array of { 'date' => x, 'value' => y } hashes, find the hash in which
-# $timestamp matches x and then remove that hash from the array
-sub remove_timestamp {
-	my $array_ref = shift;
-	my $timestamp = shift;
-	my $found = 0;
-	my $i;
-	for ($i=0; $i < scalar @{ $array_ref }; $i++) {
-		if ( $$array_ref[$i]{'date'} == $timestamp ) {
-			splice(@$array_ref, $i, 1);
-			$found = 1;
-		}
-	}
-	return $found;
-}
-
-# Given an array of { 'date' => x, 'value' => y } hashes, return an array of
-# only timestamps
-sub get_timestamps {
-	my @timestamps;
-	my $array_ref = shift;
-	my $timestamp_value_ref;
-	foreach $timestamp_value_ref (@{ $array_ref }) {
-		push(@timestamps, $$timestamp_value_ref{'date'});
-	}
-	return @timestamps = sort {$a<=>$b} @timestamps;
-}
-
 # Produce a hash of timeseries data for CPU utilization, where 1.0 is
 # equivalent to 1 logical CPU (1.0 does not necessarily mean exactly one of
 # the cpus was used at 100%, rather this value is a sum of the respective
@@ -269,68 +211,87 @@ sub get_cpubusy_series {
 }
 
 sub calc_ratio_series {
-	# This generates a new hash (using the hash referfence, $ratio) from two existing hashes
-	# (hash references $numerator and $denominator).  This is essentially:
-	# %ratio_hash = %numerator_hash / %denominator_hash
-	# Each hash is a time series, with a value for each timestamp key
-	# The timestamp keys do not need to match exactly.  Values are interrepted linearly
+	# This function calculates the memberwise ratio of two hashes (passed to
+	# hash references $numerator and $denominator) and stores the values in
+	# a new hash reference, $ratio).  This is essentially:
+	#
+	#     %ratio_hash = %numerator_hash / %denominator_hash
+	#
+	# Each hash is a time series, with a value for each timestamp key.
+	# The timestamp keys do not need to match exactly:  linear interpolation
+	# is used to produce values from the numerator which correspond to the
+	# timestamps in the denominator.  No result is produced if the denominator
+	# is zero or if the timestamp for the numerator is outside the range of
+	# the denominator.  (These hashes are passed by reference to allow the
+	# result to be returned.)
+	my $numerator = shift;
+	my $denominator = shift;
+	my $ratio = shift;
 
+	if (%{ $ratio }) {
+		die "calc_ratio_series:  output hash is not empty."
+	};
 
-	# These hashes need to be used by reference in order to preserve the changes made
-	my $params = shift;
-	my $numerator = $params;
-	$params = shift;
-	my $denominator = $params;
-	$params = shift;
-	my $ratio = $params;
+	if (!(%$numerator and %$denominator)) {
+		return;
+	}
 
-	# This would be fairly trivial if the two hashes we are dealing with had the same keys (timestamps), but there
-	# is no guarantee of that.  What we do is key off the timestamps of the second hash and interpolate a value from the first hash.
-	my $count = 0;
-	my $prev_numerator_timestamp_ms = 0;
-	my @numerator_timestamps = get_timestamps($numerator);
-	if ( scalar @numerator_timestamps == 0 ) {
-		print "warning: no timestamps found for numerator in calc_ratio_series()\n";
-		return 1;
-	}
-	my @denominator_timestamps = get_timestamps($denominator);
-	if ( scalar @denominator_timestamps == 0 ) {
-		print "warning: no timestamps found for denominator in calc_ratio_series()\n";
-		return 2;
-	}
-	while ($denominator_timestamps[0] and $numerator_timestamps[0] and $denominator_timestamps[0] < $numerator_timestamps[0]) {
-		shift(@denominator_timestamps) || last;
-	}
-	# remove any "trailing" timestamps: timestamps from denominator that come after the last timestamp in numerator
-	while ($denominator_timestamps[-1] and $numerator_timestamps[-1] and $denominator_timestamps[-1] >= $numerator_timestamps[-1]) {
-		my $unneeded_denominator_timestamp = pop(@denominator_timestamps);
-		remove_timestamp(\@{ $denominator }, $unneeded_denominator_timestamp);
-	}
-	my $numerator_timestamp_ms = shift(@numerator_timestamps);
-	my $denominator_timestamp_ms;
-	for $denominator_timestamp_ms (@denominator_timestamps) {
-		# don't attempt to calculate a ratio if we have divide by zero
-		if (get_value($denominator, $denominator_timestamp_ms) == 0) {
+	# Create "indexes" -- numerically ordered lists of timestamps -- for the two hashes.
+	my @num_timestamps = sort {$a <=> $b} keys %$numerator;
+	my @den_timestamps = sort {$a <=> $b} keys %$denominator;
+
+	# For each timestamp in the denominator, find a pair of timestamps in the
+	# numerator which bracket it (where the second timestamp from the numerator
+	# is greater than the timestamp from the denominator and, therefore the
+	# first timestamp is less than or equal to the timestamp from the
+	# denominator, since they are unique and in sorted order); perform a linear
+	# interpolation to produce a value from the numerator corresponding to the
+	# timestamp from the denominator and determine their ratio.  If the
+	# difference between the timestamp from the denominator and the first
+	# timestamp from the numerator is zero, then the interpolation, which would
+	# produce the same result, is skipped.
+	my $num_ts_1 = shift @num_timestamps;
+	my $num_ts_2 = shift @num_timestamps;
+	my $den_ts = shift @den_timestamps;
+	MAIN_LOOP:
+	while ($num_ts_1 and $den_ts) {
+		if ($num_ts_1 > $den_ts) {
 			next;
 		}
-		# find a pair of consecutive numerator timestamps which are before & after the denominator timestamp
-		# these timestamps are ordered, so once the first numerator timestamp is found that is >= denominator timestamp,
-		# the previous numerator timestamp should be < denominator timestamp.
-		while ($numerator_timestamp_ms <= $denominator_timestamp_ms) {
-			$prev_numerator_timestamp_ms = $numerator_timestamp_ms;
-			$numerator_timestamp_ms = shift(@numerator_timestamps) || last;
+		while ($num_ts_2 <= $den_ts) {
+			$num_ts_1 = $num_ts_2;
+			$num_ts_2 = shift @num_timestamps;
+			if (!defined($num_ts_2)) {
+				# We've hit the end of the numerator hash:  if the first
+				# timestamp is a match, quit this loop and continue;
+				# otherwise quit the outer loop.
+				if ($num_ts_1 == $den_ts) {
+					last;
+				}
+				else {
+					last MAIN_LOOP;
+				}
+			}
 		}
-		my $numerator_value_base = get_value($numerator, $prev_numerator_timestamp_ms);
-		my $denominator_prev_numerator_timestamp_diff_ms = ($denominator_timestamp_ms - $prev_numerator_timestamp_ms);
-		my $value_adj = 0;
-		if ($denominator_prev_numerator_timestamp_diff_ms != 0) {
-			my $numerator_prev_numerator_timestamp_diff_ms = ($numerator_timestamp_ms - $prev_numerator_timestamp_ms);
-			my $value_diff = get_value($numerator, $numerator_timestamp_ms) - $numerator_value_base;
-			$value_adj = $value_diff * $denominator_prev_numerator_timestamp_diff_ms/$numerator_prev_numerator_timestamp_diff_ms;
+		if ($num_ts_1 > $den_ts) {
+			die 'Logic bomb:  numerator timestamp (${num_ts_1}) > denominator timestamp (${den_ts})';
 		}
-		my $numerator_value_interp = $numerator_value_base + $value_adj;
-		put_value($ratio, $denominator_timestamp_ms, $numerator_value_interp/get_value($denominator, $denominator_timestamp_ms));
-		$count++;
+		my $num_value = $numerator->{$num_ts_1}{'value'};
+		my $time_diff = $den_ts - $num_ts_1;
+		if ($time_diff != 0 and defined($num_ts_2)) {
+			my $val_dif = $numerator->{$num_ts_2}{'value'} - $num_value;
+			$num_value += $val_dif * $time_diff / ($num_ts_2 - $num_ts_1);
+		}
+		my $den_value = $denominator->{$den_ts}{'value'};
+		# If the denominator is zero, we produce no result.
+		$ratio->{$den_ts} = {
+			'date'  => $den_ts,
+			'value' => $num_value / $den_value
+		} if $den_value;
+	} continue {
+		# Advance to the next denominator and iterate; we'll select a new
+		# numerator on the next iteration.
+		$den_ts = shift @den_timestamps;
 	}
 }
 
@@ -341,7 +302,7 @@ sub calc_sum_series {
 	#
 	#     %add_to_hash = %add_from_hash + %add_to_hash
 	#
-	# Each hash is a time series, with a value for each timestamp key
+	# Each hash is a time series, with a value for each timestamp key.
 	# The timestamp keys do not need to match exactly:  linear interpolation
 	# is used to produce values from the addend which correspond to the
 	# timestamps in the sum.  (The hashes are passed by reference to allow the
@@ -562,17 +523,17 @@ sub create_graph_hash {
 # arrays.
 sub convert_samples_hash_to_array {
 	my $workload_ref = shift;
+	my $ts_label = get_label('timeseries_label');
 	foreach my $metric_type (keys %$workload_ref) {
 		if ($$workload_ref{$metric_type}) {
-			foreach my $metric_name (keys %{ $$workload_ref{$metric_type} }) {
-				my $series_list = $workload_ref->{$metric_type}{$metric_name};
+			foreach my $series_list (values %{ $$workload_ref{$metric_type} }) {
 				foreach my $series (@$series_list) {
-					if (exists($series->{get_label('timeseries_label')})) {
+					if (exists($series->{$ts_label})) {
 						my @ts_array;
-						foreach my $ts (sort { $a <=> $b } keys $series->{get_label('timeseries_label')}) {
-							push(@ts_array, $series->{get_label('timeseries_label')}{$ts});
+						foreach my $ts (sort { $a <=> $b } keys $series->{$ts_label}) {
+							push(@ts_array, $series->{$ts_label}{$ts});
 						}
-						$series->{get_label('timeseries_label')} = \@ts_array;
+						$series->{$ts_label} = \@ts_array;
 					}
 				}
 			}
