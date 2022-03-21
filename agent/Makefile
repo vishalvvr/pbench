@@ -64,6 +64,7 @@ click-scripts = \
 	pbench-clear-results \
 	pbench-clear-tools \
 	pbench-config \
+	pbench-is-local \
 	pbench-list-tools \
 	pbench-list-triggers \
 	pbench-results-move \
@@ -81,6 +82,7 @@ bench-scripts = \
 	pbench-migrate \
 	pbench-netperf \
 	pbench-run-benchmark \
+	pbench-run-benchmark.pl \
 	pbench-run-benchmark-sample \
 	pbench-specjbb2005 \
 	pbench-trafficgen \

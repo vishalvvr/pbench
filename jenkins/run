@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# Run commands within the pbench-devel-${IMAGE_KIND} container image.
+#
+# Generally you want to run a shell, and `source jenkins/python-setup.sh` to
+# initialize a Pbench testing environment.
+#
+# Several customizing inputs can be given via environment variables:
+#
+# EXTRA_PODMAN_SWITCHES []
+# IMAGE_REPO [quay.io/pbench]
+# IMAGE_KIND [fedora] (see Makefile for options)
+#
+# For example, run an interactive bash shell:
+#
+#     EXTRA_PODMAN_SWITCHES=-it jenkins/run bash
+#
 if [[ "$(realpath -e $(pwd)/jenkins)" != "$(realpath -e $(dirname ${0}))" ]]; then
     printf -- "ERROR - Jenkins running from an unexpected directory, %s\n" "$(pwd)" >&2
     exit 1
@@ -16,13 +31,33 @@ if [[ -z "${IMAGE_REPO}" ]]; then
     IMAGE_REPO="quay.io/pbench"
 fi
 
+if [[ -z "${IMAGE_KIND}" ]]; then
+    IMAGE_KIND="fedora"
+fi
+
+USER_NAME=${USER}
+HOME_DIR=/home/${USER_NAME}
+
+# The PBR in our setup.py Pbench installer relies on `git` knowledge and can't
+# handle a git worktree. This handy sequence solves the problem by importing
+# the base git tree into the container along with the worktree.
+GIT_BASE_VOLUME=""
+git_dir="$(git rev-parse --absolute-git-dir)"
+if [ "${git_dir}" != "$(pwd)/.git" ]; then
+    git_common_dir="$(git rev-parse --git-common-dir)"
+    GIT_BASE_VOLUME="--volume ${git_common_dir}:${git_common_dir}:z"
+fi
+
 podman run \
     --pull=always \
     --userns=keep-id \
-    --volume $(pwd):/src/pbench:z \
-    -w /src/pbench \
-    --env-host \
+    --volume $(pwd):${HOME_DIR}/pbench:z \
+    --volume ${HOME_DIR} \
+    ${GIT_BASE_VOLUME} \
+    -w ${HOME_DIR}/pbench \
+    --env HOME=${HOME_DIR} \
+    --env USER=${USER_NAME} \
     --ulimit nofile=65536:65536 \
     --rm \
     ${EXTRA_PODMAN_SWITCHES} \
-    ${IMAGE_REPO}/pbench-devel:${_branch_name} /bin/bash -c "${*}"
+    ${IMAGE_REPO}/pbench-devel-${IMAGE_KIND}:${_branch_name} /bin/bash -c "${*}"

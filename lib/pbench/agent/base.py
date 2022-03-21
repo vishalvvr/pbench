@@ -21,12 +21,17 @@ class BaseCommand(metaclass=abc.ABCMeta):
         self.config = PbenchAgentConfig(self.context.config)
         self.name = os.path.basename(sys.argv[0])
 
-        self.pbench_run = self.config.pbench_run
+        env_pbench_run = os.environ.get("pbench_run")
+        self.pbench_run = pathlib.Path(
+            env_pbench_run if env_pbench_run else self.config.pbench_run
+        )
+
         if not self.pbench_run.exists():
-            click.secho(
-                f"[ERROR] the provided pbench run directory, {self.pbench_run}, does not exist"
+            click.echo(
+                f"[ERROR] pbench run directory does not exist, {self.pbench_run}",
+                err=True,
             )
-            sys.exit(1)
+            click.get_current_context().exit(1)
 
         # the pbench temporary directory is always relative to the $pbench_run
         # directory
@@ -58,12 +63,7 @@ class BaseCommand(metaclass=abc.ABCMeta):
         self.logger = setup_logging(debug=False, logfile=self.pbench_log)
 
         self.ssh_opts = self.config.ssh_opts
-        os.environ["ssh_opts"] = self.ssh_opts
-
         self.scp_opts = self.config.scp_opts
-        os.environ["scp_opts"] = self.scp_opts
-
-        os.environ["_pbench_debug_mode"] = "0"
         if os.environ.get("_PBENCH_UNIT_TESTS"):
             self.date = "1900-01-01T00:00:00"
             self.date_suffix = "1900.01.01T00.00.00"
@@ -74,22 +74,6 @@ class BaseCommand(metaclass=abc.ABCMeta):
             self.date_suffix = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H.%M.%s")
             self.hostname = socket.gethostname()
             self.full_hostname = socket.getfqdn()
-
-        # Backwards compatibility and for toolmeister
-        pbench_env = {
-            "date": self.date,
-            "date_suffix": self.date_suffix,
-            "hostname": self.hostname,
-            "full_hostname": self.full_hostname,
-            "pbench_run": str(self.pbench_run),
-            "pbench_install_dir": str(self.pbench_install_dir),
-            "pbench_tmp": str(self.pbench_tmp),
-            "pbench_log": str(self.pbench_log),
-            "pbench_bspp_dir": str(self.pbench_bspp_dir),
-            "pbench_lib_dir": str(self.pbench_lib_dir),
-        }
-        for k, v in pbench_env.items():
-            os.environ[k] = v
 
     @abc.abstractmethod
     def execute(self):

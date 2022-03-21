@@ -1,13 +1,14 @@
 """Tests for the utils module.
 """
-
 import os
-import pathlib
-import pytest
 import signal
+import socket
 import time
 
-from pbench.agent.utils import BaseServer, BaseReturnCode
+import ifaddr
+import pytest
+
+from pbench.agent.utils import BaseServer, BaseReturnCode, LocalRemoteHost
 
 
 class OurServer(BaseServer):
@@ -92,14 +93,13 @@ class TestBaseServer:
         assert bs.bind_port == 2345
         assert repr(bs) == "forty-two - bind.example.com:2345 / host.example.com:6789"
 
-    def test_kill(self, pytestconfig, monkeypatch):
+    def test_kill(self, tmp_path, monkeypatch):
         bs = OurServer("localhost", "localhost")
         with pytest.raises(AssertionError):
             bs.kill(1)
 
         bs = OurServer("localhost", "localhost")
-        TMP = pathlib.Path(pytestconfig.cache.get("TMP", None))
-        pidfile = TMP / "test.pid"
+        pidfile = tmp_path / "test.pid"
         pidfile.write_text("12345")
         bs.pid_file = pidfile
         ret = bs.kill(42)
@@ -109,7 +109,7 @@ class TestBaseServer:
         ret = bs.kill(42)
         assert ret == (BaseReturnCode.KILL_BADPID * 100) + 42
 
-        bs.pid_file = TMP / "enoent.pid"
+        bs.pid_file = tmp_path / "enoent.pid"
         ret = bs.kill(42)
         assert ret == 42
 
@@ -209,3 +209,49 @@ class TestBaseServer:
             monkeypatch.setattr(time, "sleep", mock_time.sleep)
             ret = bs.kill(42)
             assert ret == ret_code, f"{desc} FAILED, {pid_text!r}, {ret_code!r}"
+
+
+class TestLocalRemoteHost:
+    """Verify LocalRemoteHost class works as expected.
+    """
+
+    @staticmethod
+    def test_methods(monkeypatch):
+        monkeypatch.setattr(
+            "ifaddr.get_adapters",
+            lambda: [
+                ifaddr.Adapter(
+                    "lo",
+                    "lo",
+                    [
+                        ifaddr.IP("127.0.0.1", 8, "lo"),
+                        ifaddr.IP(("::1", 0, 0), 128, "lo"),
+                    ],
+                    1,
+                ),
+                ifaddr.Adapter(
+                    "eth0",
+                    "eth0",
+                    [
+                        ifaddr.IP("10.1.1.1", 255, "eth0"),
+                        ifaddr.IP(("2600::1", 0, 0), 64, "eth0"),
+                        ifaddr.IP(("fe80::1", 0, 2), 64, "eth0"),
+                    ],
+                    2,
+                ),
+            ],
+        )
+        lrh = LocalRemoteHost()
+
+        # An unresolvable host isn't usable for benchmarking; we expect name
+        # resolution to fail, and the exception should propagate to the caller.
+        with pytest.raises(socket.gaierror):
+            lrh.is_local("testhost.example.com")
+        assert not lrh.is_local("example.com"), "'example.com' should be remote"
+        assert lrh.is_local("localhost"), "'localhost' should be local"
+        assert not lrh.is_local("1.0.0.1"), "'1.0.0.1' should be remote"
+        assert lrh.is_local("127.0.0.1"), "'127.0.0.1' should be local"
+        assert lrh.is_local("::1"), "'::1' should be local"
+        assert lrh.is_local("2600::1"), "'2600::1' should be local"
+        assert lrh.is_local("2600::0:0:1"), "'2600::0:0:1' should be local"
+        assert not lrh.is_local("2600::3"), "'2600::3' should be remote"
