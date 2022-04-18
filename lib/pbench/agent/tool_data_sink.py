@@ -9,31 +9,28 @@
 #   sudo dnf install python3-bottle python3-daemon
 #   sudo pip3 install python-pidfile
 
+from datetime import datetime
 import errno
 import hashlib
+from http import HTTPStatus
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
-
-from configparser import DuplicateSectionError
-from datetime import datetime
-from distutils.spawn import find_executable
-from http import HTTPStatus
-from jinja2 import Environment, FileSystemLoader
-from pathlib import Path
 from threading import Thread, Lock, Condition
-from typing import Tuple
-from wsgiref.simple_server import WSGIRequestHandler, make_server
-
-import pidfile
-import redis
+from typing import Any, Dict, List, NamedTuple, Tuple
 
 from bottle import Bottle, ServerAdapter, request, abort
+from configparser import DuplicateSectionError
 from daemon import DaemonContext
+from jinja2 import Environment, FileSystemLoader
+import pidfile
+import redis
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from pbench.agent.constants import (
     tm_allowed_actions,
@@ -42,8 +39,9 @@ from pbench.agent.constants import (
     tm_channel_suffix_to_client,
     tm_channel_suffix_to_logging,
     tm_channel_suffix_to_tms,
+    tm_data_key,
 )
-from pbench.agent.redis import RedisChannelSubscriber, wait_for_conn_and_key
+from pbench.agent.redis_utils import RedisChannelSubscriber, wait_for_conn_and_key
 from pbench.agent.toolmetadata import ToolMetadata
 from pbench.agent.utils import collect_local_info
 from pbench.common import MetadataLog
@@ -58,7 +56,7 @@ fmtstr = "%(asctime)s %(levelname)s %(process)s %(thread)s %(name)s %(funcName)s
 _BUFFER_SIZE = 65536
 
 # Maximum size of the tar ball for collected tool data.
-_MAX_TOOL_DATA_SIZE = 2 ** 30
+_MAX_TOOL_DATA_SIZE = 2**30
 
 
 def _now(when):
@@ -132,8 +130,7 @@ class DataSinkWsgiServer(ServerAdapter):
         self._logger = logger
 
     def _do_notify(self, text=None, code=0, server=None):
-        """_do_notify - simple helper method to encapsulate method of notification.
-        """
+        """_do_notify - simple helper method to encapsulate method of notification."""
         with self._lock:
             self._err_text = text
             self._err_code = code
@@ -167,7 +164,7 @@ class DataSinkWsgiServer(ServerAdapter):
             server.serve_forever()
 
     def wait(self) -> Tuple[str, int]:
-        """ wait - wait for the WSGI thread executing the `run` method to start
+        """wait - wait for the WSGI thread executing the `run` method to start
         running and successfully create a WSGI server object, or fail trying.
 
         Returns a tuple of the error text and the error code set by the _run()
@@ -182,7 +179,7 @@ class DataSinkWsgiServer(ServerAdapter):
         return self._err_text, self._err_code
 
     def stop(self):
-        """ stop - stop the running WSGI server via the shutdown() method of
+        """stop - stop the running WSGI server via the shutdown() method of
         the WSGI server object.
         """
         # We have to wait for the thread to start the server and fill in the
@@ -326,7 +323,7 @@ class PromCollector(BaseCollector):
         Prometheus collector, including how to instruct prometheus to gather
         tool data.
         """
-        self.prometheus_path = find_executable("prometheus")
+        self.prometheus_path = shutil.which("prometheus")
         if self.prometheus_path is None:
             raise ToolDataSinkError("External 'prometheus' executable not found")
 
@@ -421,15 +418,15 @@ class PcpCollector(BaseCollector):
         super().__init__(*args, **kwargs)
         self.redis_host = redis_host
         self.redis_port = redis_port
-        pmcd_wait_path = find_executable("pmcd_wait")
+        pmcd_wait_path = shutil.which("pmcd_wait")
         if pmcd_wait_path is None:
             pmcd_wait_path = self._pmcd_wait_path_def
         self.pmcd_wait_path = pmcd_wait_path
-        pmlogger_path = find_executable("pmlogger")
+        pmlogger_path = shutil.which("pmlogger")
         if pmlogger_path is None:
             pmlogger_path = self._pmlogger_path_def
         self.pmlogger_path = pmlogger_path
-        pmproxy_path = find_executable("pmproxy")
+        pmproxy_path = shutil.which("pmproxy")
         if pmproxy_path is None:
             pmproxy_path = self._pmproxy_path_def
         self.pmproxy_path = pmproxy_path
@@ -731,6 +728,17 @@ class BenchmarkRunDir:
         return local_dir
 
 
+class ToolDataSinkParams(NamedTuple):
+    benchmark_run_dir: str
+    bind_hostname: str
+    port: str
+    channel_prefix: str
+    tool_group: str
+    tool_metadata: ToolMetadata
+    tool_trigger: str
+    tools: Dict[str, str]
+
+
 class ToolDataSink(Bottle):
     """ToolDataSink - sub-class of Bottle representing state for tracking data
     sent from tool meisters via an HTTP PUT method.
@@ -742,28 +750,23 @@ class ToolDataSink(Bottle):
     @staticmethod
     def fetch_params(params, pbench_run):
         try:
-            _benchmark_run_dir = params["benchmark_run_dir"]
-            bind_hostname = params["bind_hostname"]
-            port = params["port"]
-            channel_prefix = params["channel_prefix"]
-            tool_group = params["group"]
-            tool_metadata = ToolMetadata.tool_md_from_dict(params["tool_metadata"])
-            tool_trigger = params["tool_trigger"]
-            tools = params["tools"]
+            _benchmark_run_dir = BenchmarkRunDir(
+                params["benchmark_run_dir"], pbench_run
+            )
+            tdsp = ToolDataSinkParams(
+                benchmark_run_dir=_benchmark_run_dir,
+                bind_hostname=params["bind_hostname"],
+                port=params["port"],
+                channel_prefix=params["channel_prefix"],
+                tool_group=params["group"],
+                tool_metadata=ToolMetadata.tool_md_from_dict(params["tool_metadata"]),
+                tool_trigger=params["tool_trigger"],
+                tools=params["tools"],
+            )
         except KeyError as exc:
             raise ToolDataSinkError(f"Invalid parameter block, missing key {exc}")
         else:
-            benchmark_run_dir = BenchmarkRunDir(_benchmark_run_dir, pbench_run)
-            return (
-                benchmark_run_dir,
-                bind_hostname,
-                port,
-                channel_prefix,
-                tool_group,
-                tool_metadata,
-                tool_trigger,
-                tools,
-            )
+            return tdsp
 
     def __init__(
         self,
@@ -792,17 +795,7 @@ class ToolDataSink(Bottle):
         self.redis_server = redis_server
         self.redis_host = redis_host
         self.redis_port = redis_port
-        ret_val = self.fetch_params(params, pbench_run)
-        (
-            self.benchmark_run_dir,
-            self.bind_hostname,
-            self.port,
-            self.channel_prefix,
-            self.tool_group,
-            self.tool_metadata,
-            self.tool_trigger,
-            self.tools,
-        ) = ret_val
+        self.params = self.fetch_params(params, pbench_run)
         self.optional_md = optional_md
         self.logger = logger
         # Initialize internal state
@@ -814,13 +807,19 @@ class ToolDataSink(Bottle):
         self._pcp_server = None
         self._tm_tracking = None
         self._to_logging_channel = (
-            f"{self.channel_prefix}-{tm_channel_suffix_to_logging}"
+            f"{self.params.channel_prefix}-{tm_channel_suffix_to_logging}"
         )
-        self._to_tms_channel = f"{self.channel_prefix}-{tm_channel_suffix_to_tms}"
-        self._from_tms_channel = f"{self.channel_prefix}-{tm_channel_suffix_from_tms}"
-        self._to_client_channel = f"{self.channel_prefix}-{tm_channel_suffix_to_client}"
+        self._to_tms_channel = (
+            f"{self.params.channel_prefix}-{tm_channel_suffix_to_tms}"
+        )
+        self._from_tms_channel = (
+            f"{self.params.channel_prefix}-{tm_channel_suffix_from_tms}"
+        )
+        self._to_client_channel = (
+            f"{self.params.channel_prefix}-{tm_channel_suffix_to_client}"
+        )
         self._from_client_channel = (
-            f"{self.channel_prefix}-{tm_channel_suffix_from_client}"
+            f"{self.params.channel_prefix}-{tm_channel_suffix_from_client}"
         )
         self._lock = Lock()
         self._cv = Condition(lock=self._lock)
@@ -842,7 +841,7 @@ class ToolDataSink(Bottle):
             callback=self.put_document,
         )
         self._server = DataSinkWsgiServer(
-            host=self.bind_hostname, port=self.port, logger=self.logger
+            host=self.params.bind_hostname, port=self.params.port, logger=self.logger
         )
         self.web_server_thread = Thread(target=self.web_server_run)
         self.web_server_thread.start()
@@ -915,8 +914,7 @@ class ToolDataSink(Bottle):
             self.logger.debug("Exiting Tool Data Sink context ...")
 
     def web_server_run(self):
-        """web_server_run - Start the Bottle web server running.
-        """
+        """web_server_run - Start the Bottle web server running."""
         self.logger.info("Running Bottle web server ...")
         try:
             super().run(server=self._server)
@@ -935,7 +933,7 @@ class ToolDataSink(Bottle):
         # logs from remote Tool Meisters.
         logger = logging.getLogger("tm_log_capture_thread")
         logger.setLevel(logging.WARNING)
-        tm_log_file = self.benchmark_run_dir.local / "tm" / "tm.logs"
+        tm_log_file = self.params.benchmark_run_dir.local / "tm" / "tm.logs"
         with tm_log_file.open("w") as fp:
             try:
                 with self._lock:
@@ -956,11 +954,11 @@ class ToolDataSink(Bottle):
         registered tool meister(s) with data and metadata.
         """
         expecting_tms = dict()
-        for tm in self.tools.keys():
+        for tm in self.params.tools.keys():
             expecting_tms[tm] = None
         assert (
             len(expecting_tms.keys()) > 0
-        ), f"what? no tools registered? {self.tools.keys()}"
+        ), f"what? no tools registered? {self.params.tools.keys()}"
         tms = dict()
         for data in self._from_tms_chan.fetch_json(self.logger):
             # We expect the payload to look like:
@@ -1006,10 +1004,10 @@ class ToolDataSink(Bottle):
                     continue
                 else:
                     assert (
-                        host in self.tools
-                    ), f"what? {host} not in {self.tools.keys()}"
+                        host in self.params.tools
+                    ), f"what? {host} not in {self.params.tools.keys()}"
                     assert "tools" not in data, f"what? {data!r}"
-                    data["tools"] = self.tools[host]
+                    data["tools"] = self.params.tools[host]
                     tms[host] = data
             if not expecting_tms:
                 # All the expected Tool Meisters have reported back to us.
@@ -1027,8 +1025,8 @@ class ToolDataSink(Bottle):
         The second thing we do is record all the data and metadata about the
         Tool Meisters in the ${benchmark_run_dir}/metadata.log file.
         """
-        persistent_tools_l = self.tool_metadata.getPersistentTools()
-        transient_tools_l = self.tool_metadata.getTransientTools()
+        persistent_tools_l = self.params.tool_metadata.getPersistentTools()
+        transient_tools_l = self.params.tool_metadata.getTransientTools()
         for host, tm in tms.items():
             assert tm["kind"] == "tm", f"what? {tm!r}"
             assert "tools" in tm, f"what? {tm!r}"
@@ -1079,7 +1077,7 @@ class ToolDataSink(Bottle):
         home = os.environ.get("HOME", "")
         if home:
             src = str(Path(home) / ".ssh" / "config")
-            dst = str(self.benchmark_run_dir.local / "ssh.config")
+            dst = str(self.params.benchmark_run_dir.local / "ssh.config")
             try:
                 shutil.copyfile(src, dst)
             except FileNotFoundError:
@@ -1089,7 +1087,7 @@ class ToolDataSink(Bottle):
         # cp -L  /etc/ssh/ssh_config   ${dir}/ > /dev/null 2>&1
         etc_ssh = Path("/etc") / "ssh"
         src = str(etc_ssh / "ssh_config")
-        dst = str(self.benchmark_run_dir.local / "ssh_config")
+        dst = str(self.params.benchmark_run_dir.local / "ssh_config")
         try:
             shutil.copyfile(src, dst)
         except FileNotFoundError:
@@ -1126,14 +1124,14 @@ class ToolDataSink(Bottle):
                 self.cp_path,
                 "-rL",
                 "/etc/ssh/ssh_config.d",
-                f"{self.benchmark_run_dir.local}/",
+                f"{self.params.benchmark_run_dir.local}/",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        mdlog_name = self.benchmark_run_dir.local / "metadata.log"
+        mdlog_name = self.params.benchmark_run_dir.local / "metadata.log"
         mdlog = MetadataLog()
         try:
             with mdlog_name.open("r") as fp:
@@ -1146,7 +1144,7 @@ class ToolDataSink(Bottle):
         mdlog.add_section(section)
         mdlog.set(section, "config", self.optional_md["config"])
         mdlog.set(section, "date", self.optional_md["date"])
-        mdlog.set(section, "name", self.benchmark_run_dir.local.name)
+        mdlog.set(section, "name", self.params.benchmark_run_dir.local.name)
         version, seqno, sha1, hostdata = collect_local_info(self.pbench_bin)
         rpm_version = f"v{version}-{seqno}g{sha1}"
         mdlog.set(section, "rpm-version", rpm_version)
@@ -1168,9 +1166,9 @@ class ToolDataSink(Bottle):
 
         section = "tools"
         mdlog.add_section(section)
-        mdlog.set(section, "hosts", " ".join(sorted(list(self.tools.keys()))))
-        mdlog.set(section, "group", self.tool_group)
-        mdlog.set(section, "trigger", str(self.tool_trigger))
+        mdlog.set(section, "hosts", " ".join(sorted(list(self.params.tools.keys()))))
+        mdlog.set(section, "group", self.params.tool_group)
+        mdlog.set(section, "trigger", str(self.params.tool_trigger))
 
         for host, tm in sorted(tms.items()):
             section = f"tools/{host}"
@@ -1236,7 +1234,7 @@ class ToolDataSink(Bottle):
             if action not in tm_allowed_actions:
                 self.logger.warning("unrecognized action in message, %r", data)
                 return None
-            elif group != self.tool_group:
+            elif group != self.params.tool_group:
                 self.logger.warning("unrecognized tool group in message, %r", data)
                 return None
             else:
@@ -1257,6 +1255,9 @@ class ToolDataSink(Bottle):
             # Record the collected information about the Tool Meisters in the
             # run directory.
             self._tm_tracking = self.record_tms(tms)
+            self.redis_server.set(
+                tm_data_key, json.dumps(self._tm_tracking, sort_keys=True)
+            )
             self._num_tms = len(self._tm_tracking.keys())
 
             # Tell the entity that started us who we are, indicating we're
@@ -1389,7 +1390,8 @@ class ToolDataSink(Bottle):
                     ret_val = 1
                 elif status not in ("success", "terminated"):
                     self.logger.warning(
-                        "Status message not successful: '%s'", status,
+                        "Status message not successful: '%s'",
+                        status,
                     )
                     ret_val = 1
                 done_count += 1
@@ -1433,7 +1435,7 @@ class ToolDataSink(Bottle):
             # the caller wants to report that it is stopping all the Tool
             # Meisters due to an interruption (SIGINT or otherwise).
             #
-            mdlog_name = self.benchmark_run_dir.local / "metadata.log"
+            mdlog_name = self.params.benchmark_run_dir.local / "metadata.log"
             mdlog = MetadataLog()
             try:
                 with (mdlog_name).open("r") as fp:
@@ -1452,7 +1454,7 @@ class ToolDataSink(Bottle):
                 if args["interrupt"]:
                     # args["interrupt"] == True ==> run / run_interrupted
                     mdlog.set(section, "run_interrupted", "true")
-                iterations = self.benchmark_run_dir.local / ".iterations"
+                iterations = self.params.benchmark_run_dir.local / ".iterations"
                 try:
                     iterations_val = iterations.read_text()
                 except FileNotFoundError:
@@ -1478,17 +1480,17 @@ class ToolDataSink(Bottle):
             return
 
         try:
-            local_dir = self.benchmark_run_dir.validate(directory_str)
-        except self.benchmark_run_dir.Prefix:
+            local_dir = self.params.benchmark_run_dir.validate(directory_str)
+        except self.params.benchmark_run_dir.Prefix:
             self.logger.error(
                 "action '%s' with invalid directory, '%s' (not a sub-directory of '%s')",
                 action,
                 directory_str,
-                self.benchmark_run_dir,
+                self.params.benchmark_run_dir,
             )
             self._send_client_status(action, "directory not a sub-dir of run directory")
             return
-        except self.benchmark_run_dir.Exists:
+        except self.params.benchmark_run_dir.Exists:
             self.logger.error(
                 "action '%s' with invalid directory, '%s' (does not exist)",
                 action,
@@ -1515,7 +1517,7 @@ class ToolDataSink(Bottle):
                     pcp_tools = []
                     persist_tools = self._tm_tracking[tm]["persistent_tools"]
                     for tool in persist_tools:
-                        tool_data = self.tool_metadata.getProperties(tool)
+                        tool_data = self.params.tool_metadata.getProperties(tool)
                         if tool_data["collector"] == "prometheus":
                             prom_tools.append(tool)
                         elif tool_data["collector"] == "pcp":
@@ -1542,10 +1544,10 @@ class ToolDataSink(Bottle):
                 if prom_tool_dict:
                     self._prom_server = PromCollector(
                         self.pbench_bin,
-                        self.benchmark_run_dir,
-                        self.tool_group,
+                        self.params.benchmark_run_dir,
+                        self.params.tool_group,
                         prom_tool_dict,
-                        self.tool_metadata,
+                        self.params.tool_metadata,
                         self.tar_path,
                         logger=self.logger,
                     )
@@ -1557,10 +1559,10 @@ class ToolDataSink(Bottle):
                     )
                     self._pcp_server = PcpCollector(
                         self.pbench_bin,
-                        self.benchmark_run_dir,
-                        self.tool_group,
+                        self.params.benchmark_run_dir,
+                        self.params.tool_group,
                         pcp_tool_dict,
-                        self.tool_metadata,
+                        self.params.tool_metadata,
                         self.tar_path,
                         redis_host=self.redis_host,
                         redis_port=self.redis_port,
@@ -1602,7 +1604,10 @@ class ToolDataSink(Bottle):
                 self.data_ctx = None
                 self.directory = None
             else:
-                assert action in ("start", "stop",), f"Unexpected action, '{action}'"
+                assert action in (
+                    "start",
+                    "stop",
+                ), f"Unexpected action, '{action}'"
                 # Forward to TMs
                 ret_val = self._forward_tms_and_wait(data)
             self.action = None
@@ -1831,8 +1836,8 @@ class ToolDataSink(Bottle):
             abort(500, "INTERNAL ERROR")
 
 
-def get_logger(PROG, daemon=False):
-    """get_logger - construct a logger for a Tool Meister instance.
+def get_logger(PROG: str, daemon: bool = False, level: str = "info") -> logging.Logger:
+    """construct a logger for a Tool Meister Data Sync instance.
 
     If in the Unit Test environment, just log to console.
     If in non-unit test environment:
@@ -1840,7 +1845,7 @@ def get_logger(PROG, daemon=False):
        If not daemonized, log to console AND log back to Redis
     """
     logger = logging.getLogger(PROG)
-    if os.environ.get("_PBENCH_TOOL_DATA_SINK_LOG_LEVEL") == "debug":
+    if level == "debug":
         log_level = logging.DEBUG
     else:
         log_level = logging.INFO
@@ -1859,25 +1864,32 @@ def get_logger(PROG, daemon=False):
     return logger
 
 
-def driver(
-    PROG,
-    redis_server,
-    redis_host,
-    redis_port,
-    pbench_bin,
-    pbench_run,
-    hostname,
-    tar_path,
-    cp_path,
-    param_key,
-    params,
-    optional_md,
-    logger=None,
-):
-    if logger is None:
-        logger = get_logger(PROG)
+class Arguments(NamedTuple):
+    host: str
+    port: int
+    key: str
+    daemonize: bool
+    level: str
 
-    logger.debug("params_key (%s): %r", param_key, params)
+
+def driver(
+    PROG: str,
+    redis_server: redis.Redis,
+    parsed: Arguments,
+    pbench_bin: str,
+    pbench_run: str,
+    hostname: str,
+    tar_path: str,
+    cp_path: str,
+    params: Dict[str, Any],
+    optional_md: Dict[str, Any],
+    logger: logging.Logger = None,
+):
+    """Create and drive a Tool Data Sink instance"""
+    if logger is None:
+        logger = get_logger(PROG, level=parsed.level)
+
+    logger.debug("params_key (%s): %r", parsed.key, params)
 
     try:
         with ToolDataSink(
@@ -1887,8 +1899,8 @@ def driver(
             tar_path,
             cp_path,
             redis_server,
-            redis_host,
-            redis_port,
+            parsed.host,
+            parsed.port,
             params,
             optional_md,
             logger,
@@ -1914,19 +1926,18 @@ def driver(
 
 
 def daemon(
-    PROG,
-    redis_server,
-    redis_host,
-    redis_port,
-    pbench_bin,
-    pbench_run,
-    hostname,
-    tar_path,
-    cp_path,
-    param_key,
-    params,
-    optional_md,
+    PROG: str,
+    redis_server: redis.Redis,
+    parsed: Arguments,
+    pbench_bin: str,
+    pbench_run: str,
+    hostname: str,
+    tar_path: str,
+    cp_path: str,
+    params: Dict[str, Any],
+    optional_md: Dict[str, Any],
 ):
+    """Daemonize a Tool Data Sink instance"""
     # Disconnect any existing connections to the Redis server.
     redis_server.connection_pool.disconnect()
     del redis_server
@@ -1946,18 +1957,18 @@ def daemon(
         umask=0o022,
         pidfile=pfctx,
     ):
-        logger = get_logger(PROG, daemon=True)
+        logger = get_logger(PROG, daemon=True, level=parsed.level)
 
         # We have to re-open the connection to the redis server now that we
         # are "daemonized".
         logger.debug("re-constructing Redis server object")
         try:
-            redis_server = redis.Redis(host=redis_host, port=redis_port, db=0)
+            redis_server = redis.Redis(host=parsed.host, port=parsed.port, db=0)
         except Exception as e:
             logger.error(
                 "Unable to construct Redis server object, %s:%s: %s",
-                redis_host,
-                redis_port,
+                parsed.host,
+                parsed.port,
                 e,
             )
             return 7
@@ -1966,54 +1977,46 @@ def daemon(
         return driver(
             PROG,
             redis_server,
-            redis_host,
-            redis_port,
+            parsed,
             pbench_bin,
             pbench_run,
             hostname,
             tar_path,
             cp_path,
-            param_key,
             params,
             optional_md,
             logger=logger,
         )
 
 
-def main(argv):
-    _prog = Path(argv[0])
-    PROG = _prog.name
+def start(prog: Path, parsed: Arguments):
+    """
+    Start a tool data sink instance.
+
+    Args:
+        prog    The Path to the program binary
+        parsed  The Namespace resulting from parse_args
+
+    Returns:
+        integer status code (0 success, > 0 coded failure)
+    """
+
+    PROG = prog.name
     # The Tool Data Sink executable is in:
     #   ${pbench_bin}/util-scripts/tool-meister/pbench-tool-data-sink
     # So .parent at each level is:
-    #   _prog       ${pbench_bin}/util-scripts/tool-meister/pbench-tool-data-sink
+    #   prog       ${pbench_bin}/util-scripts/tool-meister/pbench-tool-data-sink
     #     .parent   ${pbench_bin}/util-scripts/tool-meister
     #     .parent   ${pbench_bin}/util-scripts
     #     .parent   ${pbench_bin}
-    pbench_bin = _prog.parent.parent.parent
+    pbench_bin = prog.parent.parent.parent
 
-    try:
-        redis_host = argv[1]
-        redis_port = argv[2]
-        param_key = argv[3]
-    except IndexError as e:
-        print(f"{PROG}: Invalid arguments: {e}", file=sys.stderr)
-        return 1
-    else:
-        if not redis_host or not redis_port or not param_key:
-            print(f"{PROG}: Invalid arguments: {argv!r}", file=sys.stderr)
-            return 1
-    try:
-        daemonize = argv[4]
-    except IndexError:
-        daemonize = "no"
-
-    tar_path = find_executable("tar")
+    tar_path = shutil.which("tar")
     if tar_path is None:
         print("External 'tar' executable not found", file=sys.stderr)
         return 2
 
-    cp_path = find_executable("cp")
+    cp_path = shutil.which("cp")
     if cp_path is None:
         print("External 'cp' executable not found", file=sys.stderr)
         return 2
@@ -2022,15 +2025,16 @@ def main(argv):
         pbench_run = os.environ["pbench_run"]
     except KeyError:
         print(
-            "Unable to fetch pbench_run environment variable", file=sys.stderr,
+            "Unable to fetch pbench_run environment variable",
+            file=sys.stderr,
         )
         return 3
 
     try:
-        redis_server = redis.Redis(host=redis_host, port=redis_port, db=0)
+        redis_server = redis.Redis(host=parsed.host, port=parsed.port, db=0)
     except Exception as e:
         print(
-            f"Unable to connect to redis server, {redis_host}:{redis_port}: {e}",
+            f"Unable to connect to redis server, {parsed.host}:{parsed.port}: {e}",
             file=sys.stderr,
         )
         return 4
@@ -2046,7 +2050,7 @@ def main(argv):
 
     try:
         # Wait for the parameter key value to show up.
-        params_str = wait_for_conn_and_key(redis_server, param_key, PROG)
+        params_str = wait_for_conn_and_key(redis_server, parsed.key, PROG)
         # The expected parameters for this "data-sink" is what "channel" to
         # subscribe to for the tool meister operational life-cycle.  The
         # data-sink listens for the actions, sysinfo | init | start | stop |
@@ -2059,26 +2063,62 @@ def main(argv):
         ToolDataSink.fetch_params(params, pbench_run)
     except Exception as ex:
         print(
-            f"Unable to fetch and decode parameter key, {param_key}: {ex}",
+            f"Unable to fetch and decode parameter key, {parsed.key}: {ex}",
             file=sys.stderr,
         )
         return 6
 
     optional_md = params.get("optional_md", dict())
 
-    func = daemon if daemonize == "yes" else driver
+    func = daemon if parsed.daemonize else driver
     ret_val = func(
         PROG,
         redis_server,
-        redis_host,
-        redis_port,
+        parsed,
         pbench_bin,
         pbench_run,
         hostname,
         tar_path,
         cp_path,
-        param_key,
         params,
         optional_md,
     )
     return ret_val
+
+
+def main(argv: List[str]):
+    """Main program for the Tool Meister.
+
+    Arguments:  argv - a list of parameters
+
+                argv[1] - host name or IP address of Redis Server
+                argv[2] - port number of Redis Server
+                argv[3] - name of key in Redis Server for operational
+                          parameters
+                argv[4] - "yes" to run as a daemon
+                argv[5] - desired debug level
+
+    Returns 0 on success, > 0 when an error occurs.
+    """
+    prog = Path(argv[0])
+    PROG = prog.name
+    try:
+        parsed = Arguments(
+            host=argv[1],
+            port=int(argv[2]),
+            key=argv[3],
+            daemonize=argv[4] == "yes" if len(argv) > 4 else False,
+            level=argv[5] if len(argv) > 5 else "info",
+        )
+    except (ValueError, IndexError) as e:
+        print(f"{PROG}: Invalid arguments, {argv!r}: {e}", file=sys.stderr)
+        return 1
+    else:
+        if not parsed.host or not parsed.port or not parsed.key:
+            print(
+                f"{PROG}: Invalid arguments, {argv!r}: must not be blank",
+                file=sys.stderr,
+            )
+            return 1
+
+    return start(prog, parsed)

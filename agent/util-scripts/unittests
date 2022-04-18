@@ -22,9 +22,9 @@ let res=res+${?}
 _testopt=${_testroot}/opt/pbench-agent
 mkdir ${_testopt}
 let res=res+${?}
-mkdir ${_testopt}/config ${_testopt}/templates ${_testopt}/util-scripts ${_testopt}/tool-scripts ${_testopt}/lib ${_testopt}/unittest-scripts ${_testopt}/common
+mkdir ${_testopt}/config ${_testopt}/templates ${_testopt}/util-scripts ${_testopt}/tool-scripts ${_testopt}/lib ${_testopt}/unittest-scripts
 let res=res+${?}
-mkdir ${_testopt}/util-scripts/tool-meister ${_testopt}/common/lib
+mkdir ${_testopt}/util-scripts/tool-meister
 let res=res+${?}
 cat ${_tdir}/../base.ut.pre ${_tdir}/../base ${_tdir}/../base.ut.post > ${_testopt}/base
 let res=res+${?}
@@ -68,8 +68,6 @@ let res=res+${?}
 
 export _testhome=${_testroot}/home
 mkdir ${_testhome}
-let res=res+${?}
-ln -s ${HOME}/.local ${_testhome}/.local
 let res=res+${?}
 
 if [[ $res -ne 0 ]]; then
@@ -125,7 +123,7 @@ function _run {
     echo "+++ Running ${tname} ${tscrpt} ${opts}" >> ${_testout}
 
     _runout=${_testroot}/run.out
-    eval ${tscrpt} ${opts} > ${_runout} 2>&1
+    _PBENCH_UNIT_TEST_NAME=${tname} eval ${tscrpt} ${opts} > ${_runout} 2>&1
     sts=${?}
 
     popd > /dev/null
@@ -152,7 +150,7 @@ function _save_tree {
 		  	  -e 's;\(tm\.[a-z-]*\)\.[0-9][0-9]*\.[a-z0-9_][a-z0-9_]*;\1.NNNNN.nnnnnnnn;g' \
         | sort >> ${_testout}
 
-    for x in $(find "${_testdir}/tools"-* "${_testdir}/tmp" -type f 2> /dev/null | sort); do
+    for x in $(find "${_testdir}/tools"-* "${_testdir}/tmp" "${_testdir}/remote" -type f 2> /dev/null | sort); do
 		y=$(echo "${x}" | sed -e 's;tmp/\([a-z-]*\)\.[0-9][0-9]*;tmp/\1.NNNNN;g' \
 		  	                  -e 's;\(tm\.[a-z-]*\)\.[0-9][0-9]*\.[a-z0-9_][a-z0-9_]*;\1.NNNNN.nnnnnnnn;g')
         echo "${y} ${x}"
@@ -184,7 +182,7 @@ function _dump_logs {
         fi
     done
     local bm_run_dir="$(basename "${benchmark_run_dir}")"
-    for actionlog in $(cd ${_testdir}; find "${bm_run_dir}" \( -name 'stop.log' -o -name 'postprocess.log' \) 2> /dev/null | sort); do
+    for actionlog in $(cd ${_testdir} && find "${bm_run_dir}" \( -name 'stop.log' -o -name 'postprocess.log' \) 2> /dev/null | sort); do
         echo "+++ ${actionlog} file contents" >> ${_testout}
         cat ${_testdir}/${actionlog} >> ${_testout} 2>&1
         echo "--- ${actionlog} file contents" >> ${_testout}
@@ -220,13 +218,18 @@ function _dump_logs {
             continue
         fi
         pdir=$(basename "${persist_dir}")
-        for file in $(cd ${persist_dir}; find * ! -name '*.tar.xz' \( -type f -o -type l \) 2> /dev/null | sort); do
+        for file in $(cd ${persist_dir} && find * ! -name '*.tar.xz' \( -type f -o -type l \) 2> /dev/null | sort); do
             file_dir=$(dirname "${file}")
             file_name=$(basename "${file}")
             echo "+++ ${pdir}/${file_dir}/${file_name} file contents" >> ${_testout}
             cat ${persist_dir}/${file} >> ${_testout} 2>&1
             echo "--- ${pdir}/${file_dir}/${file_name} file contents" >> ${_testout}
         done
+    done
+    for contents_lis in $(cd ${_testdir} && find */sysinfo -name contents.lis 2> /dev/null | sort); do
+        echo "+++ ${contents_lis} file contents" >> ${_testout}
+        cat ${_testdir}/${contents_lis} >> ${_testout} 2>&1
+        echo "--- ${contents_lis} file contents" >> ${_testout}
     done
     if [[ -f ${_testlog} ]]; then
         echo "+++ test-execution.log file contents" >> ${_testout}
@@ -427,6 +430,7 @@ declare -A tools=(
     [test-58]="pbench-stop-tools"
     [test-59]="pbench-postprocess-tools"
     [test-60]="pbench-send-tools"
+    [test-61]="test-client-tool-meister"
 )
 
 declare -A sortem=(
@@ -517,6 +521,7 @@ declare -A options=(
     [test-58]="--group=default --dir=42-iter/sample42"
     [test-59]="--group=foobar --dir=42-iter/sample42"
     [test-60]="--group=default --dir=42-iter/sample42"
+    [test-61]="lite with-remotes"
 )
 
 declare -A expected_status=(
@@ -541,6 +546,7 @@ declare -A expected_status=(
     [test-58]=1
     [test-59]=1
     [test-60]=1
+    [test-61]=1
 )
 
 declare -A pre_hooks=(
@@ -573,8 +579,31 @@ function sort_tdslog {
     sort_log_file ${_testdir}/mock-run/tm/pbench-tool-data-sink.err
 }
 
+function filter_tmerrs {
+    for lf in ${_testdir}/mock-run/tm/tm.err ${_testdir}/remote/*/tmp/tm.err; do
+        if [[ ! -f ${lf} ]]; then
+            continue
+        fi
+        grep  -F "pbench-tool-meister.logger" ${lf} > ${lf}.filtered-loggers
+        grep -vF "pbench-tool-meister.logger" ${lf} > ${lf}.filtered
+        mv ${lf}.filtered ${lf}
+        cat ${lf}.filtered-loggers >> ${lf}
+        rm ${lf}.filtered-loggers
+    done
+}
+
 function sort_tmlogs {
-    sort_log_file ${_testdir}/mock-run/tm/tm.logs
+    grep  -F "pbench-tool-meister.logger" ${_testdir}/mock-run/tm/tm.logs \
+        | sort \
+        | sed -e 's;^\([a-z\.0-9-]*\) \([0-9][0-9]*\) \(.*\)$;\1 \3;g' \
+              > ${_testdir}/mock-run/tm/tm.logs.loggers
+    grep -vF "pbench-tool-meister.logger" ${_testdir}/mock-run/tm/tm.logs \
+        | sort \
+        | sed -e 's;^\([a-z\.0-9-]*\) \([0-9][0-9]*\) \(.*\)$;\1 \3;g' \
+              > ${_testdir}/mock-run/tm/tm.logs.no-loggers
+    mv ${_testdir}/mock-run/tm/tm.logs.no-loggers ${_testdir}/mock-run/tm/tm.logs
+    cat ${_testdir}/mock-run/tm/tm.logs.loggers >> ${_testdir}/mock-run/tm/tm.logs
+    rm ${_testdir}/mock-run/tm/tm.logs.loggers
 }
 
 declare -A post_hooks=(
@@ -582,9 +611,10 @@ declare -A post_hooks=(
     [test-06]='rm ${_testopt}/unittest-scripts/pbench-tool-meister-client'
     [test-07]='cat ${_testdir}/42-iter/sample42/tools-foobar/testhost.example.com/postprocess.log >> ${_testout} 2>&1'
     [test-19]='rm ${_testopt}/unittest-scripts/pbench-tool-meister-client'
-    [test-53]='sort_testlog'
-    [test-56]='sort_testlog; sort_tdslog; sort_tmlogs'
-    [test-57]='sort_testlog; sort_tdslog; sort_tmlogs'
+    [test-53]='sort_testlog; sort_tmlogs; filter_tmerrs'
+    [test-56]='sort_testlog; sort_tdslog; sort_tmlogs; filter_tmerrs'
+    [test-57]='sort_testlog; sort_tdslog; sort_tmlogs; filter_tmerrs'
+    [test-61]='sort_testlog; sort_tdslog; sort_tmlogs; filter_tmerrs'
 )
 
 # Verify that there are no dangling gold files and sample directories.

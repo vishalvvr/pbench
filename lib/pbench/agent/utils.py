@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple
 
 from datetime import datetime
 import ifaddr
@@ -38,8 +38,7 @@ class BaseReturnCode:
     KILL_KILLEXC = 5
 
     class Err(RuntimeError):
-        """Err - exception definition to capture return code as an attribute.
-        """
+        """Err - exception definition to capture return code as an attribute."""
 
         def __init__(self, message: str, return_code: int):
             """Adds a return_code attribute to capture an integer representing
@@ -141,11 +140,18 @@ class BaseServer:
             self._repr = f"{self.name} - {self.host}:{self.port}"
 
         self.pid_file = None
+        self.pid = None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return self._repr
 
-    def kill(self, ret_val: int):
+    def get_pid(self) -> int:
+        if not self.pid:
+            raw_pid = self.pid_file.read_text()
+            self.pid = int(raw_pid)
+        return self.pid
+
+    def kill(self, ret_val: int) -> int:
         """kill - attempt to KILL the running Redis server.
 
         This method is a no-op if the server instance isn't managed by us.
@@ -155,21 +161,17 @@ class BaseServer:
         assert self.pid_file is not None, f"Logic bomb!  Unexpected state: {self!r}"
 
         try:
-            raw_pid = self.pid_file.read_text()
+            pid = self.get_pid()
         except FileNotFoundError:
             return BaseReturnCode.kill_ret_code(BaseReturnCode.KILL_SUCCESS, ret_val)
+        except ValueError:
+            # Bad pid value
+            return BaseReturnCode.kill_ret_code(BaseReturnCode.KILL_BADPID, ret_val)
         except OSError:
             return BaseReturnCode.kill_ret_code(BaseReturnCode.KILL_READERR, ret_val)
         except Exception:
             # No "pid" to kill
             return BaseReturnCode.kill_ret_code(BaseReturnCode.KILL_READEXC, ret_val)
-
-        try:
-            pid = int(raw_pid)
-        except ValueError:
-            # Bad pid value
-            return BaseReturnCode.kill_ret_code(BaseReturnCode.KILL_BADPID, ret_val)
-
         pid_exists = True
         timeout = time.time() + 60
         while pid_exists:
@@ -243,19 +245,6 @@ def setup_logging(debug, logfile):
     return rootLogger
 
 
-def run_command(args, env=None, name=None, logger=None):
-    """Run the command defined by args and return its output"""
-    try:
-        output = subprocess.check_output(args=args, stderr=subprocess.STDOUT, env=env)
-        if isinstance(output, bytes):
-            output = output.decode("utf-8")
-        return output
-    except subprocess.CalledProcessError as e:
-        message = "%s failed: %s" % (name, e.output)
-        logger.error(message)
-        raise RuntimeError(message)
-
-
 def _log_date():
     """_log_data - helper function to mimick previous bash code behaviors
 
@@ -270,8 +259,7 @@ def _log_date():
 
 
 def _pbench_log(message):
-    """_pbench_log - helper function for logging to the ${pbench_log} file.
-    """
+    """_pbench_log - helper function for logging to the ${pbench_log} file."""
     with open(os.environ["pbench_log"], "a+") as fp:
         print(message, file=fp)
 
@@ -435,7 +423,19 @@ class TemplateSsh:
         popen = subprocess.Popen(args, stdout=subprocess.PIPE, universal_newlines=True)
         self.procs[host] = popen
 
-    def wait(self, host: str) -> Tuple[int, str, str]:
+    def kill(self, host: str):
+        popen: subprocess.Popen = self.procs[host]
+        popen.kill()
+
+    def abort(self) -> None:
+        for popen in self.procs.values():
+            popen.kill()
+            try:
+                popen.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def wait(self, host: str) -> Return:
         """
         Wait for an asynchronous ssh command to complete, returning the
         completion status, stdout and stderr streams as strings.
