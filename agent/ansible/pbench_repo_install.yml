@@ -1,8 +1,0 @@
----
-- name: install pbench-agent repo
-  hosts: servers
-  remote_user: root
-
-  roles:
-    - pbench_repo_install
-

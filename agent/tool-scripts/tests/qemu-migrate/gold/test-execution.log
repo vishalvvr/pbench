@@ -1,2 +1,0 @@
-qemu-migrate-datalog 10 qemu-vm-42
-qemu-migrate-postprocess .

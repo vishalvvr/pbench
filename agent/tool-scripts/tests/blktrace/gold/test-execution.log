@@ -1,2 +1,0 @@
-blktrace-datalog /dev/sda42 /dev/sdb42 /dev/sdc42
-blktrace-stop-postprocess .

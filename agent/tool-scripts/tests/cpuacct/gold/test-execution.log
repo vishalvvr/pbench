@@ -1,3 +1,0 @@
-cpuacct-datalog 10
-cpuacct-stop-postprocess .
-cpuacct-postprocess .

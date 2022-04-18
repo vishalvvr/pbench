@@ -1,0 +1,54 @@
+baseURL = "https://pbench.netlify.app"
+# baseURL = "/"
+languageCode = "en-us"
+title = "Pbench"
+themesDir = "themes"
+theme = "hugo-whisper-theme"
+
+pygmentsCodeFences = true
+pygmentsCodefencesGuessSyntax = true
+pygmentsUseClasses = true
+
+[module]
+  [module.hugoVersion]
+    extended = true
+    min = "0.55.0"
+
+# Controls how many words are printed in the content summary on the docs homepage.
+# See https://gohugo.io/content-management/summaries/
+summaryLength = 30
+
+[[menu.main]]
+    name = "Home"
+    url = "/"
+    weight = 1
+
+[[menu.main]]
+    name = "Getting Started"
+    url = "/getting_started/"
+    weight = 2
+
+[params]
+  google_analytics_id=""
+  homepage_button_link = '/getting_started'
+  homepage_button_text = 'Getting Started'
+  homepage_intro = 'Pbench is a harness that allows data collection from a variety of tools while running a benchmark.'
+  homepage_image = '/images/home-banner-graphic.png'
+
+  ## You can enable to add anchor links to header elements
+  # enable_anchor_link = true
+
+  [params.homepage_meta_tags]
+    meta_description = "Hugo Whisper is a documentation theme built with Hugo."
+    meta_og_title = "Hugo Whisper Theme"
+    meta_og_type = "website"
+    meta_og_url = "https://hugo-whisper.netlify.app"
+    meta_og_image = "https://raw.githubusercontent.com/JugglerX/hugo-whisper-theme/master/images/tn.png"
+    meta_og_description = "Hugo Whisper is a documentation theme built with Hugo."
+    meta_twitter_card = "summary"
+    meta_twitter_site = "@zerostaticio"
+    meta_twitter_creator = "@zerostaticio"
+
+  [params.logo]
+      mobile = "/images/pbench_logo.png"
+      standard  = "/images/pbench_logo.png"

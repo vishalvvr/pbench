@@ -1,2 +1,0 @@
-virsh-migrate-datalog 42 vm42
-virsh-migrate-postprocess .

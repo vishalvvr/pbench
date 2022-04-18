@@ -1,4 +1,0 @@
-#!/bin/bash
-
-/bin/cat ${pidstat_data}
-exit 0
