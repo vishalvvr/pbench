@@ -1,8 +1,11 @@
 import datetime
 import hashlib
+from http import HTTPStatus
+import logging
 import os
 from pathlib import Path
 from posix import stat_result
+import re
 import shutil
 from stat import ST_MTIME
 import tarfile
@@ -13,6 +16,7 @@ from email_validator import EmailNotValidError, ValidatedEmail
 from freezegun import freeze_time
 import jwt
 import pytest
+from requests import Response
 
 from pbench.common import MetadataLog
 from pbench.common.logger import get_pbench_logger
@@ -34,8 +38,8 @@ default-host = pbench.example.com
 [pbench-server]
 pbench-top-dir = {TMP}/srv/pbench
 
-[Postgres]
-db_uri = sqlite:///:memory:
+[database]
+uri = sqlite:///:memory:
 
 [elasticsearch]
 host = elasticsearch.example.com
@@ -159,19 +163,45 @@ def make_logger(server_config):
 
 
 @pytest.fixture()
-def db_session(server_config, make_logger):
+def capinternal(caplog):
+    def compare(message: str, response: Optional[Response]):
+        uuid = r"[a-zA-Z\d]{8}-([a-zA-Z\d]{4}-){3}[a-zA-Z\d]{12}"
+        name = r"\w+\s+"
+        external = re.compile(f"Internal Pbench Server Error: log reference {uuid}")
+        internal = re.compile(f"{name}Internal error {uuid}: {message}")
+        if response:
+            assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+            assert external.match(response.json["message"])
+        for r in caplog.get_records("call"):
+            if r.levelno == logging.ERROR:
+                if internal.match(str(r.msg)):
+                    return
+        assert (
+            False
+        ), f"Expected pattern {internal.pattern!r} not logged at level 'ERROR': {[str(r.msg) for r in caplog.get_records('call')]}"
+
+    return compare
+
+
+@pytest.fixture()
+def db_session(request, server_config, make_logger):
     """
     Construct a temporary DB session for the test case that will reset on
     completion.
 
     NOTE: the client fixture does something similar, but without the implicit
     cleanup, and with the addition of a Flask context that non-API tests don't
-    require.
+    require. We can't let both initialize the database, or we may lose some
+    fixture setup between calls. This fixture will do nothing on load if the
+    client fixture is also selected, but we'll still remove the DB afterwards.
 
     Args:
+        request: Access to pytest's request context
         server_config: pbench-server.cfg fixture
+        make_logger: produce a Pbench Server logger
     """
-    Database.init_db(server_config, make_logger)
+    if "client" not in request.fixturenames:
+        Database.init_db(server_config, make_logger)
     yield
     Database.db_session.remove()
 
@@ -763,10 +793,6 @@ def generate_token(
 
     TODO: When we remove the User table we need to update this functionality's
         dependance on user table.
-        Refer related Jira issues:
-            https://issues.redhat.com/browse/PBENCH-900,
-            https://issues.redhat.com/browse/PBENCH-895,
-            https://issues.redhat.com/browse/PBENCH-962
 
     Returns
         JWT token string

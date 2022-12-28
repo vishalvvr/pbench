@@ -1,22 +1,18 @@
 from http import HTTPStatus
 from logging import Logger
 
-from flask import jsonify
-from flask.wrappers import Response
-
-from pbench.server import JSON, PbenchServerConfig
+from pbench.server import JSON, OperationCode, PbenchServerConfig
 from pbench.server.api.resources import (
-    API_AUTHORIZATION,
-    API_METHOD,
-    API_OPERATION,
-    APIAbort,
+    ApiAuthorizationType,
+    APIInternalError,
+    ApiMethod,
     ApiParams,
     ApiSchema,
     Parameter,
     ParamType,
     Schema,
 )
-from pbench.server.api.resources.query_apis import CONTEXT, PostprocessError
+from pbench.server.api.resources.query_apis import ApiContext, PostprocessError
 from pbench.server.api.resources.query_apis.datasets import IndexMapBase
 from pbench.server.database.models.datasets import Dataset
 from pbench.server.database.models.template import TemplateNotFound
@@ -35,8 +31,8 @@ class SampleNamespace(IndexMapBase):
             config,
             logger,
             ApiSchema(
-                API_METHOD.GET,
-                API_OPERATION.READ,
+                ApiMethod.GET,
+                OperationCode.READ,
                 uri_schema=Schema(
                     Parameter("dataset", ParamType.DATASET, required=True),
                     Parameter(
@@ -46,11 +42,11 @@ class SampleNamespace(IndexMapBase):
                         keywords=list(IndexMapBase.ES_INTERNAL_INDEX_NAMES.keys()),
                     ),
                 ),
-                authorization=API_AUTHORIZATION.DATASET,
+                authorization=ApiAuthorizationType.DATASET,
             ),
         )
 
-    def assemble(self, params: ApiParams, context: CONTEXT) -> JSON:
+    def assemble(self, params: ApiParams, context: ApiContext) -> JSON:
         """
         Construct an Elasticsearch query which returns a list of values which
         appear in each of the keyword fields in the WHITELIST_AGGS_FIELDS
@@ -84,11 +80,8 @@ class SampleNamespace(IndexMapBase):
 
         try:
             mappings = self.get_mappings(document)
-        except TemplateNotFound:
-            self.logger.exception(
-                f"Document template {document_index!r} not found in the database."
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+        except TemplateNotFound as e:
+            raise APIInternalError("Unexpected template error") from e
 
         result = self.get_aggregatable_fields(mappings)
 
@@ -109,12 +102,12 @@ class SampleNamespace(IndexMapBase):
             },
         }
 
-    def postprocess(self, es_json: JSON, context: CONTEXT) -> Response:
+    def postprocess(self, es_json: JSON, context: ApiContext) -> JSON:
         """
-        Returns a Flask Response containing a JSON object (keyword/value
-        pairs) where each key is the fully qualified dot-separated name of a
-        non-text (sub-)field and the corresponding value is a non-empty list
-        of values which appear in that field.
+        Returns a JSON object (keyword/value pairs) where each key is the fully
+        qualified dot-separated name of a non-text (sub-)field and the
+        corresponding value is a non-empty list of values which appear in that
+        field.
 
         result-data-sample document Example:
             {
@@ -167,12 +160,11 @@ class SampleNamespace(IndexMapBase):
             }
         """
         try:
-            new_json = {
+            return {
                 key: [bucket["key"] for bucket in agg["buckets"]]
                 for key, agg in es_json["aggregations"].items()
                 if agg["buckets"]
             }
-            return jsonify(new_json)
         except KeyError as e:
             raise PostprocessError(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -194,8 +186,8 @@ class SampleValues(IndexMapBase):
             config,
             logger,
             ApiSchema(
-                API_METHOD.POST,
-                API_OPERATION.READ,
+                ApiMethod.POST,
+                OperationCode.READ,
                 uri_schema=Schema(
                     Parameter("dataset", ParamType.DATASET, required=True),
                     Parameter(
@@ -209,11 +201,11 @@ class SampleValues(IndexMapBase):
                     Parameter("filters", ParamType.JSON, required=False),
                     Parameter("scroll_id", ParamType.STRING, required=False),
                 ),
-                authorization=API_AUTHORIZATION.DATASET,
+                authorization=ApiAuthorizationType.DATASET,
             ),
         )
 
-    def assemble(self, params: ApiParams, context: CONTEXT) -> JSON:
+    def assemble(self, params: ApiParams, context: ApiContext) -> JSON:
         """
         Construct an Elasticsearch query which returns a list of data values
         from a selected set of documents that belong to the given run id in
@@ -282,11 +274,8 @@ class SampleValues(IndexMapBase):
 
         try:
             mappings = self.get_mappings(document)
-        except TemplateNotFound:
-            self.logger.exception(
-                f"Document template {document_index!r} not found in the database."
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+        except TemplateNotFound as e:
+            raise APIInternalError("Unexpected template error") from e
 
         # Prepare list of filters to apply for ES query
         es_filter = [{"match": {"run.id": dataset.resource_id}}]
@@ -316,11 +305,10 @@ class SampleValues(IndexMapBase):
             },
         }
 
-    def postprocess(self, es_json: JSON, context: CONTEXT) -> Response:
+    def postprocess(self, es_json: JSON, context: ApiContext) -> JSON:
         """
-        Returns a Flask Response containing a JSON object with keys as
-        results and possibly a scroll_id if the next page of results
-        is available.
+        Returns a JSON object with keys as results and possibly a scroll_id if
+        the next page of results is available.
 
         If there are more than 10,000 documents available for the given filters, then
         we return the first 10,000 documents along with a scroll id which the client
@@ -356,7 +344,7 @@ class SampleValues(IndexMapBase):
             count = int(es_json["hits"]["total"]["value"])
             if count == 0:
                 self.logger.info("No data returned by Elasticsearch")
-                return jsonify({})
+                return {}
 
             results = [hit["_source"] for hit in es_json["hits"]["hits"]]
             ret_val = {"results": results}
@@ -367,8 +355,7 @@ class SampleValues(IndexMapBase):
             ):
                 ret_val["scroll_id"] = es_json["_scroll_id"]
 
-            return jsonify(ret_val)
-
+            return ret_val
         except KeyError as e:
             raise PostprocessError(
                 HTTPStatus.INTERNAL_SERVER_ERROR,

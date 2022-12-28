@@ -3,8 +3,9 @@ from http import HTTPStatus
 import os
 from typing import Optional
 
-from flask import abort, request
+from flask import request
 from flask_httpauth import HTTPTokenAuth
+from flask_restful import abort
 import jwt
 
 from pbench.server.auth import OpenIDClient, OpenIDClientError
@@ -60,26 +61,29 @@ class Auth:
 
     def get_auth_token(self, logger):
         # get auth token
+        example = (
+            "Please add Authorization header with Bearer token as,"
+            " 'Authorization: Bearer <session_token>'"
+        )
         auth_header = request.headers.get("Authorization")
-
         if not auth_header:
             abort(
                 HTTPStatus.FORBIDDEN,
-                message="Please add authorization token as 'Authorization: Bearer <session_token>'",
+                message=f"No Authorization header provided.  {example}",
             )
 
         try:
-            auth_schema, auth_token = auth_header.split()
+            auth_schema, auth_token = auth_header.split(" ", 1)
         except ValueError:
             abort(
                 HTTPStatus.UNAUTHORIZED,
-                message="Malformed Authorization header, please add request header as Authorization: Bearer <session_token>",
+                message=f"Malformed Authorization header.  {example}",
             )
         else:
             if auth_schema.lower() != "bearer":
                 abort(
                     HTTPStatus.UNAUTHORIZED,
-                    message="Malformed Authorization header, request needs bearer token: Bearer <session_token>",
+                    message=f"Malformed Authorization header.  {example}",
                 )
             return auth_token
 
@@ -90,8 +94,6 @@ class Auth:
         Validates the auth token.
         Note: Since we are not encoding 'aud' claim in our JWT tokens
         we need to set 'verify_aud' to False while validating the token.
-        With issue https://issues.redhat.com/browse/PBENCH-895 we can
-        set it to True when we start validating third party OIDC tokens.
         :param auth_token:
         :return: User object/None
         """
@@ -140,11 +142,10 @@ class Auth:
         Returns:
             True if the verification succeeds else False
         """
-        identity_provider_pubkey = oidc_client.get_oidc_public_key(auth_token)
         try:
             oidc_client.token_introspect_offline(
                 token=auth_token,
-                key=identity_provider_pubkey,
+                key=oidc_client.get_oidc_public_key(),
                 audience=oidc_client.client_id,
                 options={
                     "verify_signature": True,

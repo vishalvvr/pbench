@@ -6,12 +6,12 @@ import re
 from typing import Any, Dict, List, Optional, Union
 
 from dateutil import parser as date_parser
-from sqlalchemy import Column, DateTime, Enum, event, ForeignKey, Integer, JSON, String
+from sqlalchemy import Column, Enum, event, ForeignKey, Integer, JSON, String
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Query, relationship, validates
-from sqlalchemy.types import TypeDecorator
 
 from pbench.server.database.database import Database
+from pbench.server.database.models import TZDateTime
 from pbench.server.database.models.server_config import (
     OPTION_DATASET_LIFETIME,
     ServerConfig,
@@ -325,52 +325,6 @@ class States(enum.Enum):
         return self.friendly
 
 
-def current_time() -> datetime.datetime:
-    """
-    Return the current time in UTC.
-
-    This provides a Callable that can be specified in the SQLAlchemy Column
-    to generate an appropriate (aware UTC) datetime object when a Dataset
-    object is created.
-
-    Returns:
-        Current UTC timestamp
-    """
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-class TZDateTime(TypeDecorator):
-    """
-    SQLAlchemy protocol is that stored timestamps are naive UTC; so we use a
-    custom type decorator to ensure that our incoming and outgoing timestamps
-    are consistent by adjusting TZ before storage and enhancing with UTC TZ
-    on retrieval so that we're always working with "aware" UTC.
-    """
-
-    impl = DateTime
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        """
-        "Naive" datetime objects are treated as UTC, and "aware" datetime
-        objects are converted to UTC and made "naive" by replacing the TZ
-        for SQL storage.
-        """
-        if value is not None and value.utcoffset() is not None:
-            value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-        return value
-
-    def process_result_value(self, value, dialect):
-        """
-        Retrieved datetime objects are naive, and are assumed to be UTC, so set
-        the TZ to UTC to make them "aware". This ensures that we communicate
-        the "+00:00" ISO 8601 suffix to API clients.
-        """
-        if value is not None:
-            value = value.replace(tzinfo=datetime.timezone.utc)
-        return value
-
-
 class Dataset(Database.Base):
     """
     Identify a Pbench dataset (tarball plus metadata)
@@ -442,7 +396,7 @@ class Dataset(Database.Base):
     resource_id = Column(String(255), unique=True, nullable=False)
 
     # Time of Dataset record creation
-    uploaded = Column(TZDateTime, nullable=False, default=current_time)
+    uploaded = Column(TZDateTime, nullable=False, default=TZDateTime.current_time)
 
     # Time of the data collection run (from metadata.log `date`). This is the
     # time the data was generated as opposed to the date it was imported into
@@ -453,7 +407,7 @@ class Dataset(Database.Base):
     state = Column(Enum(States), unique=False, nullable=False, default=States.UPLOADING)
 
     # Timestamp when Dataset state was last changed
-    transition = Column(TZDateTime, nullable=False, default=current_time)
+    transition = Column(TZDateTime, nullable=False, default=TZDateTime.current_time)
 
     # NOTE: this relationship defines a `dataset` property in `Metadata`
     # that refers to the parent `Dataset` object.
@@ -676,11 +630,14 @@ class Dataset(Database.Base):
             raise DatasetBadParameterType(new_state, States)
         elif new_state not in self.transitions[self.state]:
             self.logger.error(
-                "Current state {} can't advance to {}", self.state, new_state
+                "{}, Current state {} can't advance to {}", self, self.state, new_state
             )
             raise DatasetBadStateTransition(self, new_state)
 
         # TODO: this would be a good place to generate an audit log
+        self.logger.debug(
+            "{}, Current state {}, advancing to {}", self, self.state, new_state
+        )
 
         self.state = new_state
         self.transition = datetime.datetime.utcnow()
@@ -694,12 +651,12 @@ class Dataset(Database.Base):
             Database.db_session.add(self)
             Database.db_session.commit()
         except IntegrityError as e:
-            Dataset.logger.warning("Duplicate dataset {}: {}", self.name, e)
             Database.db_session.rollback()
+            self.logger.warning("Duplicate dataset {}: {}", self.name, e)
             raise DatasetDuplicate(self.name) from None
         except Exception:
-            self.logger.exception("Can't add {} to DB", str(self))
             Database.db_session.rollback()
+            self.logger.exception("Can't add {} to DB", str(self))
             raise DatasetSqlError("adding", name=self.name)
 
     def update(self):
@@ -710,8 +667,8 @@ class Dataset(Database.Base):
         try:
             Database.db_session.commit()
         except Exception:
-            self.logger.error("Can't update {} in DB", str(self))
             Database.db_session.rollback()
+            self.logger.error("Can't update {} in DB", str(self))
             raise DatasetSqlError("updating", name=self.name)
 
     def delete(self):
@@ -801,11 +758,10 @@ class Metadata(Database.Base):
     # {"user.dashboard.favorite": True}
     USER = "user"
 
-    # "Native" keys are the value of the PostgreSQL "key" column in the SQL
-    # table. We support hierarchical nested keys of the form "server.indexed",
-    # but the first element of any nested key path must be one of these. The
-    # METALOG key is special, representing the Metadata table portion of the
-    # DATASET
+    # "Native" keys are the value of the database "key" column in the SQL table.
+    # We support hierarchical nested keys of the form "server.indexed", but the
+    # first element of any nested key path must be one of these. The METALOG key
+    # is special, representing the Metadata table portion of the DATASET.
     METALOG = "metalog"
     NATIVE_KEYS = [GLOBAL, METALOG, SERVER, USER]
 
@@ -1248,8 +1204,8 @@ class Metadata(Database.Base):
             Database.db_session.add(self)
             Database.db_session.commit()
         except Exception as e:
-            Metadata.logger.exception("Can't add {}>>{} to DB", dataset, self.key)
             Database.db_session.rollback()
+            self.logger.exception("Can't add {}>>{} to DB", dataset, self.key)
             dataset.metadatas.remove(self)
             raise MetadataSqlError("adding", dataset, self.key) from e
 
@@ -1260,8 +1216,8 @@ class Metadata(Database.Base):
         try:
             Database.db_session.commit()
         except Exception as e:
-            Metadata.logger.exception("Can't update {} in DB", self)
             Database.db_session.rollback()
+            self.logger.exception("Can't update {} in DB", self)
             raise MetadataSqlError("updating", self.dataset, self.key) from e
 
     def delete(self):
@@ -1272,8 +1228,8 @@ class Metadata(Database.Base):
             Database.db_session.delete(self)
             Database.db_session.commit()
         except Exception as e:
-            Metadata.logger.exception("Can't delete {} from DB", self)
             Database.db_session.rollback()
+            self.logger.exception("Can't delete {} from DB", self)
             raise MetadataSqlError("deleting", self.dataset, self.key) from e
 
 

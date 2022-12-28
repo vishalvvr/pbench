@@ -2,16 +2,39 @@ import datetime
 import errno
 import hashlib
 from http import HTTPStatus
+from logging import Logger
 import os
 import shutil
+from typing import Optional
 
-from flask import jsonify, request
-from flask_restful import abort, Resource
+from flask import jsonify
+from flask.wrappers import Request, Response
 import humanize
 
 from pbench.common.utils import Cleanup, validate_hostname
+from pbench.server import PbenchServerConfig
+from pbench.server.api.resources import (
+    APIAbort,
+    ApiAuthorizationType,
+    ApiBase,
+    ApiContext,
+    APIInternalError,
+    ApiMethod,
+    ApiParams,
+    ApiSchema,
+    Parameter,
+    ParamType,
+    Schema,
+)
 from pbench.server.auth.auth import Auth
 from pbench.server.cache_manager import CacheManager
+from pbench.server.database.models.audit import (
+    Audit,
+    AuditReason,
+    AuditStatus,
+    AuditType,
+    OperationCode,
+)
 from pbench.server.database.models.datasets import (
     Dataset,
     DatasetDuplicate,
@@ -19,7 +42,6 @@ from pbench.server.database.models.datasets import (
     Metadata,
     States,
 )
-from pbench.server.database.models.server_config import ServerConfig
 from pbench.server.sync import Operation, Sync
 from pbench.server.utils import filesize_bytes, UtcTimeHelper
 
@@ -35,8 +57,11 @@ class CleanupTime(Exception):
         self.status = status
         self.message = message
 
+    def __str__(self) -> str:
+        return self.message
 
-class Upload(Resource):
+
+class Upload(ApiBase):
     """
     Upload a dataset from an agent. This API accepts a tarball, controller
     name, and MD5 value from a client. After validation, it creates a new
@@ -48,9 +73,20 @@ class Upload(Resource):
     CHUNK_SIZE = 65536
     DEFAULT_RETENTION_DAYS = 90
 
-    def __init__(self, config, logger):
-        self.config = config
-        self.logger = logger
+    def __init__(self, config: PbenchServerConfig, logger: Logger):
+        super().__init__(
+            config,
+            logger,
+            ApiSchema(
+                ApiMethod.PUT,
+                OperationCode.CREATE,
+                uri_schema=Schema(Parameter("filename", ParamType.STRING)),
+                query_schema=Schema(Parameter("access", ParamType.ACCESS)),
+                audit_type=AuditType.NONE,
+                audit_name="upload",
+                authorization=ApiAuthorizationType.NONE,
+            ),
+        )
         self.max_content_length = filesize_bytes(
             self.config.get_conf(
                 __name__, "pbench-server", "rest_max_content_length", self.logger
@@ -60,15 +96,53 @@ class Upload(Resource):
         self.temporary.mkdir(mode=0o755, parents=True, exist_ok=True)
         self.logger.info("Configured PUT temporary directory as {}", self.temporary)
 
-    @Auth.token_auth.login_required()
-    def put(self, filename: str):
-        disabled = ServerConfig.get_disabled()
-        if disabled:
-            abort(HTTPStatus.SERVICE_UNAVAILABLE, **disabled)
+    def _put(self, args: ApiParams, request: Request, context: ApiContext) -> Response:
+        """Upload a dataset to the server.
+
+        The client must present an authentication bearer token for a registered
+        Pbench Server user.
+
+        We get the requested filename from the URI: /api/v1/upload/<filename>.
+
+        We get the originating controller nodename from a custom "controller"
+        HTTP header.
+
+        We get the dataset's resource ID (which is the tarball's MD5 checksum)
+        from the "content-md5" HTTP header.
+
+        We also check that the "content-length" header value is not 0, and that
+        it matches the final size of the uploaded tarball file.
+
+        We expect the dataset's tarball file to be uploaded as a data stream.
+
+        If the new dataset is created successfully, return 201 (CREATED).
+
+        The tarball name must be unique on the Pbench Server. If the name
+        given matches an existing dataset, and has an identical MD5 resource ID
+        value, return 200 (OK). If the identically named dataset does not have
+        the same MD5 resource ID, return 400 and a diagnostic message.
+
+        NOTE: This API audits internally, as we don't know the resource ID or
+        name of the dataset until we've processed the parameters. We also
+        authenticate internally as we only require that a registered user be
+        identified rather than authorizing against an existing resource.
+
+        Args:
+            filename:   A filename matching the metadata of the uploaded tarball
+        """
 
         # Used to record what steps have been completed during the upload, and
         # need to be undone on failure
         recovery = Cleanup(self.logger)
+        audit: Optional[Audit] = None
+        username: Optional[str] = None
+        controller: Optional[str] = None
+        access = (
+            args.query["access"] if "access" in args.query else Dataset.PRIVATE_ACCESS
+        )
+        filename = args.uri["filename"]
+
+        self.logger.info("Uploading {} with {} access", filename, access)
 
         try:
             try:
@@ -76,6 +150,7 @@ class Upload(Resource):
                 username = Auth.token_auth.current_user().username
             except Exception:
                 username = None
+                user_id = None
                 raise CleanupTime(HTTPStatus.UNAUTHORIZED, "Verifying user_id failed")
 
             controller = request.headers.get("controller")
@@ -141,6 +216,8 @@ class Upload(Resource):
 
             tar_full_path = self.temporary / filename
             md5_full_path = self.temporary / f"{filename}.md5"
+            dataset_name = Dataset.stem(tar_full_path)
+
             bytes_received = 0
             usage = shutil.disk_usage(tar_full_path.parent)
             self.logger.info(
@@ -151,7 +228,7 @@ class Upload(Resource):
             )
 
             self.logger.info(
-                "PUT uploading {}:{} for user = (user_id: {}, username: {}) to {}",
+                "PUT uploading {}:{} for user_id {} (username: {}) to {}",
                 controller,
                 filename,
                 user_id,
@@ -165,10 +242,10 @@ class Upload(Resource):
                     owner_id=user_id,
                     name=Dataset.stem(tar_full_path),
                     resource_id=md5sum,
+                    access=access,
                 )
                 dataset.add()
             except DatasetDuplicate:
-                dataset_name = Dataset.stem(tar_full_path)
                 self.logger.info(
                     "Dataset already exists, user = (user_id: {}, username: {}), file = {!a}",
                     user_id,
@@ -199,6 +276,14 @@ class Upload(Resource):
                     message="Unable to create dataset",
                 )
 
+            audit = Audit.create(
+                operation=OperationCode.CREATE,
+                name="upload",
+                user_id=user_id,
+                user_name=username,
+                dataset=dataset,
+                status=AuditStatus.BEGIN,
+            )
             recovery.add(dataset.delete)
 
             self.logger.info(
@@ -236,7 +321,7 @@ class Upload(Resource):
                     else:
                         raise CleanupTime(
                             HTTPStatus.INTERNAL_SERVER_ERROR,
-                            "Unexpected error encountered during file upload",
+                            f"Unexpected error {exc.errno} encountered during file upload",
                         )
                 except Exception:
                     raise CleanupTime(
@@ -371,38 +456,46 @@ class Upload(Resource):
             try:
                 dataset.advance(States.UPLOADED)
                 Sync(self.logger, "upload").update(
-                    dataset=dataset, enabled=[Operation.BACKUP, Operation.UNPACK]
+                    dataset=dataset,
+                    enabled=[Operation.BACKUP, Operation.UNPACK],
+                    status="ok",
                 )
+                Audit.create(root=audit, status=AuditStatus.SUCCESS)
             except Exception as exc:
                 raise CleanupTime(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     f"Unable to finalize dataset {dataset}: {exc!s}",
                 )
         except Exception as e:
-            status = HTTPStatus.INTERNAL_SERVER_ERROR
-            abort_msg = "INTERNAL ERROR"
+            message = str(e)
             if isinstance(e, CleanupTime):
-                cause = e.__cause__ if e.__cause__ else e.__context__
-                if e.status == HTTPStatus.INTERNAL_SERVER_ERROR:
-                    log_func = self.logger.exception if cause else self.logger.error
-                    log_func(
-                        "{}:{}:{} error {}", username, controller, filename, e.message
-                    )
-                else:
-                    self.logger.warning(
-                        "{}:{}:{} error {} ({})",
-                        username,
-                        controller,
-                        filename,
-                        e.message,
-                        cause,
-                    )
-                    abort_msg = e.message
                 status = e.status
             else:
-                self.logger.exception("Unexpected exception in outer try")
+                status = HTTPStatus.INTERNAL_SERVER_ERROR
+
+            # NOTE: there are nested try blocks so we can't be 100% confident
+            # here that an audit "root" object was created. We don't audit on
+            # header validation/consistency errors caught before we decide that
+            # we have a "resource" to track. We won't try to audit failure if
+            # we didn't create the root object.
+            if audit:
+                if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+                    reason = AuditReason.INTERNAL
+                    audit_msg = "INTERNAL ERROR"
+                else:
+                    reason = AuditReason.CONSISTENCY
+                    audit_msg = message
+                Audit.create(
+                    root=audit,
+                    status=AuditStatus.FAILURE,
+                    reason=reason,
+                    attributes={"message": audit_msg},
+                )
             recovery.cleanup()
-            abort(status, message=abort_msg)
+            if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+                raise APIInternalError(message) from e
+            else:
+                raise APIAbort(status, message) from e
 
         response = jsonify(dict(message="File successfully uploaded"))
         response.status_code = HTTPStatus.CREATED

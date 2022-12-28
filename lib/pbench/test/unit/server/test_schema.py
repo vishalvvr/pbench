@@ -1,12 +1,15 @@
 from http import HTTPStatus
+import json
 from typing import Callable, Union
 
 from dateutil import parser as date_parser
+from flask.wrappers import Response
 import pytest
 
+from pbench.server import OperationCode
 from pbench.server.api.resources import (
-    API_OPERATION,
     APIAbort,
+    APIInternalError,
     ConversionError,
     InvalidRequestPayload,
     KeywordError,
@@ -36,13 +39,13 @@ class TestExceptions:
         a1 = APIAbort(HTTPStatus.CONFLICT)
         assert str(a1) == HTTPStatus.CONFLICT.phrase
         assert repr(a1) == "API error 409 : Conflict"
-        e = UnauthorizedAccess(create_user, API_OPERATION.READ, "you", "public")
+        e = UnauthorizedAccess(create_user, OperationCode.READ, "you", "public")
         assert (
             str(e)
             == "User test is not authorized to READ a resource owned by you with public access"
         )
         assert e.user == create_user
-        e = UnauthorizedAccess(None, API_OPERATION.UPDATE, "me", "private")
+        e = UnauthorizedAccess(None, OperationCode.UPDATE, "me", "private")
         assert (
             str(e)
             == "Unauthenticated client is not authorized to UPDATE a resource owned by me with private access"
@@ -74,6 +77,16 @@ class TestExceptions:
         p = PostprocessError(HTTPStatus.BAD_REQUEST, "really bad", None)
         assert str(p) == "Postprocessing error returning 400: 'really bad' [None]"
         assert p.status == HTTPStatus.BAD_REQUEST
+
+    def test_internal_error(self, capinternal, make_logger):
+        x = APIInternalError("my error")
+        make_logger.error(f"TEST {x.details}")
+        r = Response(
+            response=json.dumps({"message": x.message}),
+            mimetype="application/json",
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        capinternal("my error", r)
 
 
 class TestParamType:

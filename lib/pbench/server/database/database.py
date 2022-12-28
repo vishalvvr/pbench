@@ -14,16 +14,16 @@ class Database:
 
     @staticmethod
     def get_engine_uri(config, logger):
+        engine_uri = None
         try:
-            psql = config.get("Postgres", "db_uri")
-            return psql
-        except (NoSectionError, NoOptionError):
-            msg = "Failed to find a [Postgres] section in configuration file."
+            engine_uri = config.get("database", "uri")
+        except (NoSectionError, NoOptionError) as exc:
+            msg = "Error in configuration file: {}"
             if logger:
-                logger.error(msg)
+                logger.error(msg, exc)
             else:
-                print(msg, file=sys.stderr)
-            return None
+                print(msg.format(exc), file=sys.stderr)
+        return engine_uri
 
     @staticmethod
     def init_db(server_config, logger):

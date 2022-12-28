@@ -5,6 +5,7 @@ import json
 from json.decoder import JSONDecodeError
 from logging import Logger
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Union
+import uuid
 
 from dateutil import parser as date_parser
 from flask import request
@@ -12,8 +13,14 @@ from flask.wrappers import Request, Response
 from flask_restful import abort, Resource
 from sqlalchemy.orm.query import Query
 
-from pbench.server import JSON, JSONOBJECT, JSONVALUE, PbenchServerConfig
+from pbench.server import JSON, JSONOBJECT, JSONVALUE, OperationCode, PbenchServerConfig
 from pbench.server.auth.auth import Auth
+from pbench.server.database.models.audit import (
+    Audit,
+    AuditReason,
+    AuditStatus,
+    AuditType,
+)
 from pbench.server.database.models.datasets import (
     Dataset,
     DatasetNotFound,
@@ -26,11 +33,11 @@ from pbench.server.database.models.users import User
 
 
 class APIAbort(Exception):
-    """
-    Used to report an error and abort if there is a failure in processing of API request.
+    """Used to report an error and abort if there is a failure in processing of
+    API request.
     """
 
-    def __init__(self, http_status: int, message: str = None):
+    def __init__(self, http_status: int, message: Optional[str] = None):
         self.http_status = http_status
         self.message = message if message else HTTPStatus(http_status).phrase
 
@@ -41,16 +48,50 @@ class APIAbort(Exception):
         return self.message
 
 
-class UnauthorizedAccess(APIAbort):
+class APIInternalError(APIAbort):
+    """Used to report a server internal error with a UUID value that connects
+    the string reported to the client with a server log entry to aid analysis
+    by an SRE
     """
-    The user is not authorized for the requested operation on the specified
+
+    def __init__(self, details: str):
+        """Construct an "internal server error" exception object.
+
+        This exception is raised and will be used in the API _dispatch method
+        to generate a JSON error message payload to the client. This message
+        contains a UUID string that uniquely identifies this internal server
+        error context. An internal server log message is generated, with
+        traceback, also containing that UUID value so that a server
+        administrator can investigate the cause of the error.
+
+        NOTE: We want to return minimal explanations of internal errors to the
+        client while capturing detailed information for server developers to
+        determine what happened.
+
+        NOTE: We use a fully formatted "details" message here for convenience;
+        we will report this with `logger.exception`, which is never disabled,
+        so deferring the formatting would have no value.
+
+        Args:
+            details: A detailed message to be logged when this exception is caught
+        """
+        u = uuid.uuid4()
+        super().__init__(
+            http_status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            message=f"Internal Pbench Server Error: log reference {u}",
+        )
+        self.details = f"Internal error {u}: {details}"
+
+
+class UnauthorizedAccess(APIAbort):
+    """The user is not authorized for the requested operation on the specified
     resource.
     """
 
     def __init__(
         self,
         user: Union[User, None],
-        operation: "API_OPERATION",
+        operation: "OperationCode",
         owner: Union[str, None],
         access: Union[str, None],
         http_status: int = HTTPStatus.FORBIDDEN,
@@ -66,15 +107,14 @@ class UnauthorizedAccess(APIAbort):
 
 
 class UnauthorizedAdminAccess(UnauthorizedAccess):
-    """
-    A refinement of the UnauthorizedAccess exception where ADMIN access is
+    """A refinement of the UnauthorizedAccess exception where ADMIN access is
     required and we have no associated resource owner and access.
     """
 
     def __init__(
         self,
         user: Union[User, None],
-        operation: "API_OPERATION",
+        operation: "OperationCode",
         http_status: int = HTTPStatus.FORBIDDEN,
     ):
         super().__init__(
@@ -90,9 +130,7 @@ class UnauthorizedAdminAccess(UnauthorizedAccess):
 
 
 class SchemaError(APIAbort):
-    """
-    Generic base class for errors in processing a JSON schema.
-    """
+    """Generic base class for errors in processing a JSON schema."""
 
     def __init__(self, http_status: int = HTTPStatus.BAD_REQUEST):
         super().__init__(http_status=http_status)
@@ -102,9 +140,8 @@ class SchemaError(APIAbort):
 
 
 class UnverifiedUser(SchemaError):
-    """
-    Attempt by an unauthenticated client to reference a username in a query. An
-    unauthenticated client does not have the right to look up any username.
+    """Attempt by an unauthenticated client to reference a username in a query.
+    An unauthenticated client does not have the right to look up any username.
 
     HTTPStatus.UNAUTHORIZED tells the client that the operation might succeed
     if the request is retried with authentication. (A UI might redirect to a
@@ -120,17 +157,14 @@ class UnverifiedUser(SchemaError):
 
 
 class InvalidRequestPayload(SchemaError):
-    """
-    A required client JSON input document is missing.
-    """
+    """A required client JSON input document is missing."""
 
     def __str__(self) -> str:
         return "Invalid request payload"
 
 
 class UnsupportedAccessMode(SchemaError):
-    """
-    Unsupported values for user or access, or an unsupported combination of
+    """Unsupported values for user or access, or an unsupported combination of
     both.
     """
 
@@ -144,9 +178,8 @@ class UnsupportedAccessMode(SchemaError):
 
 
 class MissingParameters(SchemaError):
-    """
-    One or more required JSON keys are missing, or the values are unexpectedly
-    empty.
+    """One or more required JSON keys are missing, or the values are
+    unexpectedly empty.
     """
 
     def __init__(self, keys: List[str]):
@@ -158,9 +191,7 @@ class MissingParameters(SchemaError):
 
 
 class BadQueryParam(SchemaError):
-    """
-    One or more unrecognized URL query parameters were specified.
-    """
+    """One or more unrecognized URL query parameters were specified."""
 
     def __init__(self, keys: List[str]):
         super().__init__()
@@ -171,8 +202,8 @@ class BadQueryParam(SchemaError):
 
 
 class RepeatedQueryParam(SchemaError):
-    """
-    A URL query parameter key was repeated, but Pbench supports only one value.
+    """A URL query parameter key was repeated, but Pbench supports only one
+    value.
     """
 
     def __init__(self, key: str):
@@ -184,13 +215,10 @@ class RepeatedQueryParam(SchemaError):
 
 
 class ConversionError(SchemaError):
-    """
-    Used to report an invalid parameter type
-    """
+    """Used to report an invalid parameter type"""
 
     def __init__(self, value: Any, expected_type: str, **kwargs):
-        """
-        Construct a ConversionError exception
+        """Construct a ConversionError exception
 
         Args:
             value: The value we tried to convert
@@ -206,13 +234,10 @@ class ConversionError(SchemaError):
 
 
 class DatasetConversionError(SchemaError):
-    """
-    Used to report an invalid dataset name.
-    """
+    """Used to report an invalid dataset name."""
 
     def __init__(self, value: str, **kwargs):
-        """
-        Construct a DatasetConversionError exception. This is modeled after
+        """Construct a DatasetConversionError exception. This is modeled after
         DatasetNotFound, but is within the SchemaError exception hierarchy.
 
         Args:
@@ -227,9 +252,7 @@ class DatasetConversionError(SchemaError):
 
 
 class KeywordError(SchemaError):
-    """
-    Used to report an unrecognized keyword value.
-    """
+    """Used to report an unrecognized keyword value."""
 
     def __init__(
         self,
@@ -239,8 +262,7 @@ class KeywordError(SchemaError):
         *,
         keywords: List[str] = [],
     ):
-        """
-        Construct a KeywordError exception
+        """Construct a KeywordError exception
 
         Args:
             parameter: The Parameter defining the keywords
@@ -260,13 +282,10 @@ class KeywordError(SchemaError):
 
 
 class ListElementError(SchemaError):
-    """
-    Used to report an unrecognized list element value.
-    """
+    """Used to report an unrecognized list element value."""
 
     def __init__(self, parameter: "Parameter", bad: List[str]):
-        """
-        Construct a ListElementError exception
+        """Construct a ListElementError exception
 
         Args:
             parameter: The Parameter defining the list
@@ -286,8 +305,7 @@ class ListElementError(SchemaError):
 
 
 def convert_date(value: str, _) -> datetime:
-    """
-    Convert a date/time string to a datetime.datetime object.
+    """Convert a date/time string to a datetime.datetime object.
 
     Args:
         value: String representation of date/time
@@ -306,9 +324,8 @@ def convert_date(value: str, _) -> datetime:
 
 
 def convert_username(value: Union[str, None], _) -> Union[str, None]:
-    """
-    Validate that the user object referenced by the username string exists, and
-    return the internal representation of that user.
+    """Validate that the user object referenced by the username string exists,
+    and return the internal representation of that user.
 
     We do not want an unauthenticated client to be able to distinguish between
     "invalid user" (ConversionError here) and "valid user I can't access" (some
@@ -449,12 +466,15 @@ def convert_int(value: Union[int, str], _) -> int:
     raise ConversionError(value, int.__name__)
 
 
-def convert_keyword(value: str, parameter: "Parameter") -> str:
+def convert_keyword(value: str, parameter: "Parameter") -> Union[str, Enum]:
     """
     Verify that the parameter value is a string and a member of the
     `valid` list. The match is case-blind and will return the lowercased
     version of the input keyword. If there are no keywords defined, the
     input is lowercased and returned without validation.
+
+    If the 'enum' Parameter property is set, attempt to convert the string
+    to an instance of the enum type.
 
     Keyword matching recognizes a "path" keyword where validation occurs only
     on the first element of a dotted path (e.g., "user.contact.email" matches
@@ -474,6 +494,12 @@ def convert_keyword(value: str, parameter: "Parameter") -> str:
 
     if type(value) is not str:
         raise ConversionError(value, str.__name__)
+    if parameter.enum:
+        try:
+            return parameter.enum[value.upper()]
+        except ValueError as e:
+            raise KeywordError(parameter, "enum", [value]) from e
+
     input = value.lower()
     if not parameter.keywords:
         return input
@@ -560,6 +586,10 @@ def convert_access(value: str, parameter: "Parameter") -> str:
     return v
 
 
+# A type defined to pass context through API methods.
+ApiContext = Dict[str, Any]
+
+
 class ParamType(Enum):
     """
     Define the possible JSON query parameter keys, and their type.
@@ -603,11 +633,12 @@ class Parameter:
         name: str,
         type: ParamType,
         *,  # Following are keyword-only
-        keywords: Union[List[str], None] = None,
-        element_type: Union[ParamType, None] = None,
+        keywords: Optional[List[str]] = None,
+        element_type: Optional[ParamType] = None,
         required: bool = False,
         key_path: bool = False,
-        string_list: Union[str, None] = None,
+        string_list: Optional[str] = None,
+        enum: Optional[type[Enum]] = None,
     ):
         """
         Initialize a Parameter object describing a JSON parameter with its type
@@ -623,6 +654,8 @@ class Parameter:
                 element matches the keyword list.
             string_list: if a delimiter is specified, individual string values
                 will be split into lists.
+            enum: An Enum subclass to which an upcased keyword should be
+                converted.
         """
         self.name = name
         self.type = type
@@ -631,6 +664,7 @@ class Parameter:
         self.required = required
         self.key_path = key_path
         self.string_list = string_list
+        self.enum = enum
 
     def invalid(self, json: JSONOBJECT) -> bool:
         """
@@ -672,7 +706,7 @@ class ParamSet(NamedTuple):
     value: Any
 
 
-class API_METHOD(Enum):
+class ApiMethod(Enum):
     DELETE = auto()
     GET = auto()
     HEAD = auto()
@@ -680,25 +714,7 @@ class API_METHOD(Enum):
     PUT = auto()
 
 
-class API_OPERATION(Enum):
-    """
-    The standard CRUD REST API operations:
-
-        CREATE: Instantiate a new resource
-        READ:   Retrieve the state of a resource
-        UPDATE: Modify the state of a resource
-        DELETE: Remove a resource
-
-    NOTE: only READ and UPDATE are currently used by Pbench queries.
-    """
-
-    CREATE = auto()
-    READ = auto()
-    UPDATE = auto()
-    DELETE = auto()
-
-
-class API_AUTHORIZATION(Enum):
+class ApiAuthorizationType(Enum):
     """
     Defines the mechanism by which ApiBase infrastructure will automatically
     authorize the client for the API method:
@@ -738,8 +754,8 @@ class ApiAuthorization(NamedTuple):
     the desired access role.
     """
 
-    type: API_AUTHORIZATION
-    role: API_OPERATION
+    type: ApiAuthorizationType
+    role: OperationCode
     user: Optional[str] = None
     access: Optional[str] = None
 
@@ -838,13 +854,15 @@ class ApiSchema:
 
     def __init__(
         self,
-        method: API_METHOD,
-        operation: API_OPERATION,
+        method: ApiMethod,
+        operation: OperationCode,
         body_schema: Optional[Schema] = None,
         query_schema: Optional[Schema] = None,
         uri_schema: Optional[Schema] = None,
         *,
-        authorization: API_AUTHORIZATION = API_AUTHORIZATION.NONE,
+        audit_type: AuditType = AuditType.NONE,
+        audit_name: Optional[str] = None,
+        authorization: ApiAuthorizationType = ApiAuthorizationType.NONE,
     ):
         """
         Construct an ApiSchema encapsulating a set of schema objects separating
@@ -852,25 +870,32 @@ class ApiSchema:
         apply to a particular HTTP method.
 
         Args:
-            method: API method
-            operation:  CRUD operation code
-            body_schema:    Definition of parameters received through a JSON
-                            body.
-            query_schema:   Definition of parameters received through query
-                            parameters.
-            uri_schema:     Definition of parameters received through Flask URI
-                            templates.
-            authorization:  How to authorize access to this API method; the
-                            authorization process triggers on a specific type
-                            of parameter, DATASET or USER, which must appear in
-                            exactly one of the three schema defined for this
-                            HTTP method.
+            method:
+                    API method
+            operation:
+                    CRUD operation code
+            body_schema:
+                    Definition of parameters received through a JSON body.
+            query_schema: Definition of parameters received through query
+                    parameters.
+            uri_schema: Definition of parameters received through Flask URI
+                    templates.
+            audit_type: The type of resource affected by API calls; only
+                    meaningful for CREATE/UPDATE/DELETE operations.
+            audit_name:
+                    The name to use for the audit record
+            authorization: How to authorize access to this API method; the
+                    authorization process triggers on a specific type of
+                    parameter, DATASET or USER, which must appear in exactly
+                    one of the set of schema defined for an HTTP method.
         """
         self.method = method
         self.operation = operation
         self.body_schema = body_schema
         self.query_schema = query_schema
         self.uri_schema = uri_schema
+        self.audit_type = audit_type
+        self.audit_name = audit_name
         self.authorization = authorization
 
     def get_param_by_type(
@@ -944,14 +969,18 @@ class ApiSchema:
         Using the API schema's designated authorization source, provide the
         necessary information for the caller to authorize access.
 
-        AUTHORIZATION.DATASET: Used when the API wants to authorize access to a
-            specific dataset, using the dataset owner and access property. The
-            ApiSchema must contain a parameter of type ParamType.DATASET which
-            must have a value.
-        AUTHORIZATION.USER_ACCESS: Used when authorizing a search for datasets
-            with specific ownership and access properties.The ApiSchema must
-            contain a parameter of type ParamType.USER and one of
-            ParamType.ACCESS. Unspecified values will be reported as None.
+        ApiAuthorizationType.DATASET: Used when the API wants to authorize
+            access to a specific dataset, using the dataset owner and access
+            property. The ApiSchema must contain a parameter of type
+            ParamType.DATASET which must have a value.
+        ApiAuthorizationType.USER_ACCESS: Used when authorizing a search for
+            datasets with specific ownership and access properties. The
+            ApiSchema must contain a parameter of type ParamType.USER and one
+            of ParamType.ACCESS. Unspecified values will be reported as None.
+        ApiAuthorizationType.ADMIN: Used when only a user with ADMIN role can
+            access the resource.
+        ApiAuthorizationType.NONE: Either no authorization is required, or the
+            API has custom authorization requirements.
 
         Args
             params:   The validated and converted parameter set for the API.
@@ -959,7 +988,7 @@ class ApiSchema:
         Returns
             The values for username and access policy to use for authorization.
         """
-        if self.authorization == API_AUTHORIZATION.DATASET:
+        if self.authorization == ApiAuthorizationType.DATASET:
             ds = self.get_param_by_type(ParamType.DATASET, params)
             if ds:
                 return ApiAuthorization(
@@ -969,7 +998,7 @@ class ApiSchema:
                     role=self.operation,
                 )
             return None
-        elif self.authorization == API_AUTHORIZATION.USER_ACCESS:
+        elif self.authorization == ApiAuthorizationType.USER_ACCESS:
             user = self.get_param_by_type(ParamType.USER, params)
             access = self.get_param_by_type(ParamType.ACCESS, params)
             return ApiAuthorization(
@@ -978,7 +1007,7 @@ class ApiSchema:
                 access=access.value,
                 role=self.operation,
             )
-        elif self.authorization == API_AUTHORIZATION.ADMIN:
+        elif self.authorization == ApiAuthorizationType.ADMIN:
             return ApiAuthorization(type=self.authorization, role=self.operation)
         return None
 
@@ -992,9 +1021,11 @@ class ApiSchemaSet:
             schemas: A list of schemas for each HTTP method supported by an
                 API class.
         """
-        self.schemas: Dict[API_METHOD, ApiSchema] = {s.method: s for s in schemas}
+        if not schemas:
+            raise RuntimeError("At least one ApiSchema must be provided")
+        self.schemas: Dict[ApiMethod, ApiSchema] = {s.method: s for s in schemas}
 
-    def __getitem__(self, key: API_METHOD):
+    def __getitem__(self, key: ApiMethod):
         return self.schemas.get(key)
 
     def __iter__(self):
@@ -1004,7 +1035,7 @@ class ApiSchemaSet:
         return item in self.schemas
 
     def get_param_by_type(
-        self, method: API_METHOD, dtype: ParamType, params: Optional[ApiParams]
+        self, method: ApiMethod, dtype: ParamType, params: Optional[ApiParams]
     ) -> Optional[ParamSet]:
         """
         Find the first relevant parameter of the desired type.
@@ -1029,14 +1060,10 @@ class ApiSchemaSet:
         """
         return self.schemas[method].get_param_by_type(dtype, params)
 
-    def validate(self, method: API_METHOD, args: ApiParams) -> ApiParams:
+    def validate(self, method: ApiMethod, args: ApiParams) -> ApiParams:
         """
         Validate the parameter schema based on the HTTP method used by the
         client.
-
-        If there is no schema defined, this method will assume that there are
-        no client parameters to validate or convert, and return an empty set of
-        parameters.
 
         NOTE: This allows an API that has no parameters defined; e.g., to get
         global information.
@@ -1045,13 +1072,10 @@ class ApiSchemaSet:
             method: The HTTP method (GET, PUT, POST, DELETE)
             args:   An argument set to validate against the selected schema
         """
-        if method in self.schemas:
-            return self.schemas[method].validate(args)
-        else:
-            return ApiParams(body=None, query=None, uri=None)
+        return self.schemas[method].validate(args)
 
     def authorize(
-        self, method: API_METHOD, args: ApiParams
+        self, method: ApiMethod, args: ApiParams
     ) -> Optional[ApiAuthorization]:
         """
         Determine how API validation should deal with client authorization for
@@ -1067,10 +1091,7 @@ class ApiSchemaSet:
         Returns:
             The values for username and access policy to use for authorization.
         """
-        if method in self.schemas:
-            return self.schemas[method].authorize(args)
-        else:
-            return None
+        return self.schemas[method].authorize(args)
 
 
 class ApiBase(Resource):
@@ -1201,15 +1222,13 @@ class ApiBase(Resource):
             if user:
                 username = user.username
             else:
-                self.logger.error(
-                    "Parser user ID {} not found in User database", user_id
-                )
+                self.logger.error("User ID {} not found", user_id)
 
         # The ADMIN authorization doesn't involve a target resource owner or
         # access, so take care of that first as a special case. If there is
         # an authenticated user, and that user holds ADMIN access rights, the
         # check passes. Otherwise raise an "admin access" failure.
-        if mode.type == API_AUTHORIZATION.ADMIN:
+        if mode.type == ApiAuthorizationType.ADMIN:
             self.logger.debug(
                 "Authorizing {} access for {} to an administrative resource",
                 role,
@@ -1246,7 +1265,7 @@ class ApiBase(Resource):
         #    authenticated client.
         # 4) An authenticated client cannot mutate data owned by a different
         #    user, nor READ private data owned by another user.
-        if role == API_OPERATION.READ and access == Dataset.PUBLIC_ACCESS:
+        if role == OperationCode.READ and access == Dataset.PUBLIC_ACCESS:
             # We are reading public data: this is always allowed.
             pass
         else:
@@ -1265,7 +1284,7 @@ class ApiBase(Resource):
                     access,
                     HTTPStatus.UNAUTHORIZED,
                 )
-            elif role != API_OPERATION.READ and user_id is None:
+            elif role != OperationCode.READ and user_id is None:
                 # No target user is specified, so we won't allow mutation of
                 # data: REJECT
                 self.logger.warning(
@@ -1472,8 +1491,7 @@ class ApiBase(Resource):
 
     def _dispatch(
         self,
-        method: API_METHOD,
-        request: Request,
+        method: ApiMethod,
         uri_params: Optional[JSONOBJECT] = None,
     ) -> Response:
         """
@@ -1485,7 +1503,6 @@ class ApiBase(Resource):
 
         Args:
             method: The API HTTP method
-            request: The flask Request object containing payload and headers
             uri_params: URI encoded keyword-arg supplied by the Flask
                 framework
 
@@ -1496,71 +1513,84 @@ class ApiBase(Resource):
 
         api_name = self.__class__.__name__
 
-        self.logger.info("In {} {}", method, api_name)
+        self.logger.info("In {} {}: mime {}", method, api_name, request.mimetype)
 
-        if not self.always_enabled:
-            disabled = ServerConfig.get_disabled(
-                readonly=(self.schemas[method].operation == API_OPERATION.READ)
-            )
-            if disabled:
-                abort(HTTPStatus.SERVICE_UNAVAILABLE, **disabled)
-
-        if method is API_METHOD.GET:
+        if method is ApiMethod.GET:
             execute = self._get
-        elif method is API_METHOD.PUT:
+        elif method is ApiMethod.HEAD:
+            execute = self._head
+        elif method is ApiMethod.PUT:
             execute = self._put
-        elif method is API_METHOD.POST:
+        elif method is ApiMethod.POST:
             execute = self._post
-        elif method is API_METHOD.DELETE:
+        elif method is ApiMethod.DELETE:
             execute = self._delete
         else:
             abort(
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 message=HTTPStatus.METHOD_NOT_ALLOWED.phrase,
             )
+        if method not in self.schemas:
+            abort(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                message=HTTPStatus.METHOD_NOT_ALLOWED.phrase,
+            )
 
-        if self.schemas[method]:
-            body_params = None
-            query_params = None
+        if not self.always_enabled:
+            readonly = self.schemas[method].operation == OperationCode.READ
+            disabled = ServerConfig.get_disabled(readonly=readonly)
+            if disabled:
+                abort(HTTPStatus.SERVICE_UNAVAILABLE, **disabled)
 
-            # If there's a JSON payload, parse it, and fail if parsing fails.
-            # If there's no payload and the API requires JSON body parameters,
-            # then the schema validation will diagnose later.
-            if request.data and request.mimetype == "application/json":
-                try:
-                    body_params = request.get_json()
-                except Exception as e:
-                    abort(
-                        HTTPStatus.BAD_REQUEST,
-                        message=f"Invalid request payload: {str(e)!r}",
-                    )
+        if not self.always_enabled and self.schemas[method]:
+            if self.schemas[method]:
+                readonly = self.schemas[method].operation == OperationCode.READ
+            else:
+                readonly = False
+            disabled = ServerConfig.get_disabled(readonly=readonly)
+            if disabled:
+                abort(HTTPStatus.SERVICE_UNAVAILABLE, **disabled)
 
+        schema = self.schemas[method]
+        body_params = None
+        query_params = None
+
+        # If there's a JSON payload, parse it, and fail if parsing fails.
+        # If there's no payload and the API requires JSON body parameters,
+        # then the schema validation will diagnose later.
+        if request.mimetype == "application/json" and schema.body_schema:
             try:
-                if self.schemas[method].query_schema:
-                    query_params = self._gather_query_params(
-                        request, self.schemas[method].query_schema
-                    )
-
-                params = self.schemas.validate(
-                    method,
-                    ApiParams(body=body_params, query=query_params, uri=uri_params),
-                )
-            except APIAbort as e:
-                self.logger.exception("{} {}", api_name, e)
-                abort(e.http_status, message=str(e))
+                body_params = request.get_json()
             except Exception as e:
-                self.logger.exception("{} API error: {}", api_name, e)
                 abort(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    message=HTTPStatus.INTERNAL_SERVER_ERROR.phrase,
+                    HTTPStatus.BAD_REQUEST,
+                    message=f"Invalid request payload: {str(e)!r}",
                 )
-        else:
-            params = ApiParams(None, None, None)
+
+        try:
+            if schema.query_schema:
+                query_params = self._gather_query_params(request, schema.query_schema)
+
+            params = self.schemas.validate(
+                method,
+                ApiParams(body=body_params, query=query_params, uri=uri_params),
+            )
+        except APIInternalError as e:
+            self.logger.exception("{} {}", api_name, e.details)
+            abort(e.http_status, message=str(e))
+        except APIAbort as e:
+            abort(e.http_status, message=str(e))
+        except Exception:
+            # Construct an APIInternalError to get the UUID and standard return
+            # message.
+            x = APIInternalError("Unexpected validation exception")
+            self.logger.exception("{} {}", api_name, x.details)
+            abort(x.http_status, message=str(x))
 
         # Automatically authorize the operation only if the API schema for the
         # active HTTP method has authorization enabled, using the selected
         # parameters. Automatic authorization can be disabled by selecting
-        # API_AUTHORIZATION.NONE for a particular method's schema where either
+        # ApiAuthorization.NONE for a particular method's schema where either
         # no authorization is required, or a specialized authorization
         # mechanism is required by the API.
         auth_params = self.schemas.authorize(method, params)
@@ -1570,26 +1600,93 @@ class ApiBase(Resource):
             except UnauthorizedAccess as e:
                 self.logger.warning("{}: {}", api_name, e)
                 abort(e.http_status, message=str(e))
-            except Exception as e:
-                self.logger.exception("{}: {}", api_name, e)
-                abort(
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    message=HTTPStatus.INTERNAL_SERVER_ERROR.phrase,
-                )
+            except APIInternalError as e:
+                self.logger.exception("{} {}", api_name, e.details)
+                abort(e.http_status, message=str(e))
+            except Exception:
+                # Construct an APIInternalError to get the UUID and standard return
+                # message.
+                x = APIInternalError("Unexpected authorize exception")
+                self.logger.exception("{} {}", api_name, x.details)
+                abort(x.http_status, message=str(x))
 
-        try:
-            return execute(params, request)
-        except APIAbort as e:
-            self.logger.exception("{} {}", api_name, e)
-            abort(e.http_status, message=str(e))
-        except Exception as e:
-            self.logger.exception("{} API error: {}", api_name, e)
-            abort(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                message=HTTPStatus.INTERNAL_SERVER_ERROR.phrase,
+        audit = None
+
+        if (
+            schema.audit_type is not AuditType.NONE
+            and schema.operation is not OperationCode.READ
+        ):
+            user = Auth.token_auth.current_user()
+            dataset_found = schema.get_param_by_type(ParamType.DATASET, params)
+            dataset = dataset_found.value if dataset_found else None
+
+            audit = Audit.create(
+                operation=schema.operation,
+                status=AuditStatus.BEGIN,
+                user=user,
+                name=schema.audit_name,
+                dataset=dataset,
+                object_type=schema.audit_type,
             )
 
-    def _get(self, args: ApiParams, request: Request) -> Response:
+        # Pass the root audit object to the API implementation. Normally, we'll
+        # automatically generate an audit finalization; however if the API
+        # wants to emit a special audit sequence it can disable "finalize"
+        # in the context. It can also pass "attributes" by setting that
+        # field.
+        auditing = {
+            "audit": audit,
+            "finalize": bool(audit),
+            "status": AuditStatus.SUCCESS,
+            "reason": None,
+            "attributes": None,
+        }
+
+        try:
+            response = execute(params, request, {"auditing": auditing})
+            if auditing["finalize"]:
+                Audit.create(
+                    root=auditing["audit"],
+                    status=auditing["status"],
+                    reason=auditing["reason"],
+                    attributes=auditing["attributes"],
+                )
+            return response
+        except APIInternalError as e:
+            self.logger.exception("{} {}", api_name, e.details)
+            abort(e.http_status, message=str(e))
+        except APIAbort as e:
+            if auditing["finalize"]:
+                attr = auditing.get("attributes", {"message": str(e)})
+                try:
+                    Audit.create(
+                        root=auditing["audit"],
+                        status=AuditStatus.FAILURE,
+                        reason=auditing["reason"],
+                        attributes=attr,
+                    )
+                except Exception:
+                    self.logger.error(
+                        "Unexpected exception on audit: {}", json.dumps(auditing)
+                    )
+            abort(e.http_status, message=str(e))
+        except Exception as e:
+            self.logger.exception(
+                "Exception {} API error: {}: {!r}", api_name, e, json.dumps(auditing)
+            )
+            if auditing["finalize"]:
+                attr = auditing.get("attributes", {})
+                attr["message"] = str(e)
+                Audit.create(
+                    root=auditing["audit"],
+                    status=AuditStatus.FAILURE,
+                    reason=AuditReason.INTERNAL,
+                    attributes=attr,
+                )
+            x = APIInternalError("Unexpected exception")
+            abort(x.http_status, message=x.message)
+
+    def _get(self, args: ApiParams, request: Request, context: ApiContext) -> Response:
         """
         ABSTRACT METHOD: override in subclass to perform operation
 
@@ -1598,6 +1695,7 @@ class ApiBase(Resource):
         Args:
             args: Type-normalized client argument sets
             request: Original incoming Request object
+            context: API context dictionary
 
         Returns:
             Response to return to client
@@ -1606,7 +1704,25 @@ class ApiBase(Resource):
             f"Class {self.__class__.__name__} doesn't override abstract _get method"
         )
 
-    def _post(self, args: ApiParams, request: Request) -> Response:
+    def _head(self, args: ApiParams, request: Request, context: ApiContext) -> Response:
+        """
+        ABSTRACT METHOD: override in subclass to perform operation
+
+        Perform the requested HEAD operation, and handle any exceptions.
+
+        Args:
+            args: Type-normalized client argument sets
+            request: Original incoming Request object
+            context: API context dictionary
+
+        Returns:
+            Response to return to client
+        """
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't override abstract _head method"
+        )
+
+    def _post(self, args: ApiParams, request: Request, context: ApiContext) -> Response:
         """
         ABSTRACT METHOD: override in subclass to perform operation
 
@@ -1615,6 +1731,7 @@ class ApiBase(Resource):
         Args:
             args: Type-normalized client argument sets
             request: Original incoming Request object
+            context: API context dictionary
 
         Returns:
             Response to return to client
@@ -1623,7 +1740,7 @@ class ApiBase(Resource):
             f"Class {self.__class__.__name__} doesn't override abstract _post method"
         )
 
-    def _put(self, args: ApiParams, request: Request) -> Response:
+    def _put(self, args: ApiParams, request: Request, context: ApiContext) -> Response:
         """
         ABSTRACT METHOD: override in subclass to perform operation
 
@@ -1632,6 +1749,7 @@ class ApiBase(Resource):
         Args:
             args: Type-normalized client argument sets
             request: Original incoming Request object
+            context: API context dictionary
 
         Returns:
             Response to return to client
@@ -1640,7 +1758,9 @@ class ApiBase(Resource):
             f"Class {self.__class__.__name__} doesn't override abstract _put method"
         )
 
-    def _delete(self, args: ApiParams, request: Request) -> Response:
+    def _delete(
+        self, args: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         ABSTRACT METHOD: override in subclass to perform operation
 
@@ -1649,6 +1769,7 @@ class ApiBase(Resource):
         Args:
             args: Type-normalized client argument sets
             request: Original incoming Request object
+            context: API context dictionary
 
         Returns:
             Response to return to client
@@ -1658,29 +1779,36 @@ class ApiBase(Resource):
         )
 
     @Auth.token_auth.login_required(optional=True)
-    def get(self, **kwargs):
+    def get(self, **kwargs) -> Response:
         """
         Handle an authenticated GET operation on the Resource
         """
-        return self._dispatch(API_METHOD.GET, request, kwargs)
+        return self._dispatch(ApiMethod.GET, kwargs)
 
     @Auth.token_auth.login_required(optional=True)
-    def post(self, **kwargs):
+    def head(self, **kwargs) -> Response:
+        """
+        Handle an authenticated HEAD operation on the Resource
+        """
+        return self._dispatch(ApiMethod.HEAD, kwargs)
+
+    @Auth.token_auth.login_required(optional=True)
+    def post(self, **kwargs) -> Response:
         """
         Handle an authenticated POST operation on the Resource
         """
-        return self._dispatch(API_METHOD.POST, request, kwargs)
+        return self._dispatch(ApiMethod.POST, kwargs)
 
     @Auth.token_auth.login_required(optional=True)
-    def put(self, **kwargs):
+    def put(self, **kwargs) -> Response:
         """
         Handle an authenticated PUT operation on the Resource
         """
-        return self._dispatch(API_METHOD.PUT, request, kwargs)
+        return self._dispatch(ApiMethod.PUT, kwargs)
 
     @Auth.token_auth.login_required(optional=True)
-    def delete(self, **kwargs):
+    def delete(self, **kwargs) -> Response:
         """
         Handle an authenticated DELETE operation on the Resource
         """
-        return self._dispatch(API_METHOD.DELETE, request, kwargs)
+        return self._dispatch(ApiMethod.DELETE, kwargs)

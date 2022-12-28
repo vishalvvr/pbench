@@ -1,17 +1,17 @@
-from http import HTTPStatus
 from logging import Logger
-from typing import AnyStr, List, Union
+from typing import AnyStr, List, NoReturn, Union
 
 from pbench.server import JSON, PbenchServerConfig
 from pbench.server.api.resources import (
-    API_AUTHORIZATION,
-    APIAbort,
+    ApiAuthorizationType,
+    ApiContext,
+    APIInternalError,
     ApiParams,
     ApiSchema,
     ParamType,
     SchemaError,
 )
-from pbench.server.api.resources.query_apis import CONTEXT, ElasticBase
+from pbench.server.api.resources.query_apis import ElasticBase
 from pbench.server.database.models.datasets import Dataset, Metadata, MetadataError
 from pbench.server.database.models.template import Template
 
@@ -100,15 +100,15 @@ class IndexMapBase(ElasticBase):
             raise MissingDatasetNameParameter(
                 api_name, "dataset parameter is not defined or not required"
             )
-        if self.schema.authorization != API_AUTHORIZATION.DATASET:
+        if self.schema.authorization != ApiAuthorizationType.DATASET:
             raise MissingDatasetNameParameter(
                 api_name, "schema authorization is not by dataset"
             )
 
-    def preprocess(self, params: ApiParams) -> CONTEXT:
+    def preprocess(self, params: ApiParams, context: ApiContext) -> NoReturn:
         """
         Identify the Dataset on which we're operating, and return it in the
-        CONTEXT for the Elasticsearch assembly and postprocessing.
+        context for the Elasticsearch assembly and postprocessing.
 
         Note that the class constructor validated that the API is authorized
         using the Dataset ownership/access, so validation and authorization has
@@ -118,8 +118,7 @@ class IndexMapBase(ElasticBase):
         _, dataset = self.schemas.get_param_by_type(
             self.schema.method, ParamType.DATASET, params
         )
-
-        return {"dataset": dataset}
+        context["dataset"] = dataset
 
     def get_index(self, dataset: Dataset, root_index_name: AnyStr) -> AnyStr:
         """
@@ -129,12 +128,14 @@ class IndexMapBase(ElasticBase):
         try:
             index_map = Metadata.getvalue(dataset=dataset, key=Metadata.INDEX_MAP)
         except MetadataError as exc:
-            self.logger.error("{}", str(exc))
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.logger.error("{}", exc)
+            raise APIInternalError(f"Required metadata {Metadata.INDEX_MAP} missing")
 
         if index_map is None:
             self.logger.error("Index map metadata has no value")
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            raise APIInternalError(
+                f"Required metadata {Metadata.INDEX_MAP} has no value"
+            )
 
         index_keys = [key for key in index_map if root_index_name in key]
         indices = ",".join(index_keys)

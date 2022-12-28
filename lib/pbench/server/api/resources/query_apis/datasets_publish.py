@@ -1,18 +1,19 @@
 from logging import Logger
-from typing import Iterator
+from typing import Any, Iterator
 
-from pbench.server import JSON, PbenchServerConfig
+from pbench.server import JSONOBJECT, OperationCode, PbenchServerConfig
 from pbench.server.api.resources import (
-    API_AUTHORIZATION,
-    API_METHOD,
-    API_OPERATION,
+    ApiAuthorizationType,
+    ApiMethod,
+    ApiParams,
     ApiSchema,
     Parameter,
     ParamType,
     Schema,
 )
-from pbench.server.api.resources.query_apis import ElasticBulkBase
-from pbench.server.database.models.datasets import Dataset, Metadata
+from pbench.server.api.resources.query_apis import ApiContext, ElasticBulkBase
+from pbench.server.database.models.audit import AuditType
+from pbench.server.database.models.datasets import Dataset
 
 
 class DatasetsPublish(ElasticBulkBase):
@@ -20,6 +21,8 @@ class DatasetsPublish(ElasticBulkBase):
     Change the "access" authorization of a Pbench dataset by modifying the
     "authorization": {"access": value} subdocument of each Elasticsearch
     document associated with the specified dataset.
+
+    Called as `POST /api/v1/datasets/publish/{resource_id}?access=public`
     """
 
     def __init__(self, config: PbenchServerConfig, logger: Logger):
@@ -27,33 +30,45 @@ class DatasetsPublish(ElasticBulkBase):
             config,
             logger,
             ApiSchema(
-                API_METHOD.POST,
-                API_OPERATION.UPDATE,
+                ApiMethod.POST,
+                OperationCode.UPDATE,
                 uri_schema=Schema(
                     Parameter("dataset", ParamType.DATASET, required=True)
                 ),
-                body_schema=Schema(
+                query_schema=Schema(
                     Parameter("access", ParamType.ACCESS, required=True),
                 ),
-                authorization=API_AUTHORIZATION.DATASET,
+                audit_type=AuditType.DATASET,
+                audit_name="publish",
+                authorization=ApiAuthorizationType.DATASET,
             ),
             action="update",
+            require_stable=True,
+            require_map=True,
         )
 
-    def generate_actions(self, params: JSON, dataset: Dataset) -> Iterator[dict]:
+    def generate_actions(
+        self,
+        params: ApiParams,
+        dataset: Dataset,
+        context: ApiContext,
+        map: dict[str, list[str]],
+    ) -> Iterator[dict]:
         """
         Generate a series of Elasticsearch bulk update actions driven by the
         dataset document map.
 
         Args:
-            params: API request body parameters
+            params: API parameters
             dataset: the Dataset object
+            context: CONTEXT to pass to complete
+            map: Elasticsearch index document map
 
         Returns:
             A generator for Elasticsearch bulk update actions
         """
-        access = params["access"]
-        map = Metadata.getvalue(dataset=dataset, key=Metadata.INDEX_MAP)
+        access = params.query["access"]
+        context["access"] = access
 
         self.logger.info("Starting publish operation for dataset {}", dataset)
 
@@ -73,7 +88,9 @@ class DatasetsPublish(ElasticBulkBase):
                     "doc": {"authorization": {"access": access}},
                 }
 
-    def complete(self, dataset: Dataset, params: JSON, summary: JSON) -> None:
+    def complete(
+        self, dataset: Dataset, context: ApiContext, summary: JSONOBJECT
+    ) -> None:
         """
         Complete the publish operation by updating the access of the Dataset
         object.
@@ -83,11 +100,14 @@ class DatasetsPublish(ElasticBulkBase):
 
         Args:
             dataset: Dataset object
-            params: API parameters
+            context: CONTEXT dictionary
             summary: summary of the bulk operation
                 ok: count of successful updates
                 failure: count of failures
         """
+        auditing: dict[str, Any] = context["auditing"]
+        attributes = auditing["attributes"]
+        attributes["access"] = context["access"]
         if summary["failure"] == 0:
-            dataset.access = params["access"]
+            dataset.access = context["access"]
             dataset.update()

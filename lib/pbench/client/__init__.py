@@ -54,6 +54,7 @@ class API(Enum):
     LOGIN = "login"
     LOGOUT = "logout"
     REGISTER = "register"
+    SERVER_AUDIT = "server_audit"
     SERVER_CONFIGURATION = "server_configuration"
     UPLOAD = "upload"
     USER = "user"
@@ -366,7 +367,12 @@ class PbenchServerClient:
         Returns:
             The PUT response object
         """
+        query_parameters = {}
+
         md5 = kwargs.get("md5", Dataset.md5(tarball))
+        access = kwargs.get("access", "private")
+        if access == "public":
+            query_parameters["access"] = access
         if "controller" in kwargs:
             controller = kwargs["controller"]
         else:
@@ -376,17 +382,22 @@ class PbenchServerClient:
                     .read()
                     .decode()
                 )
-            metadata = ConfigParser()
+            metadata = ConfigParser(interpolation=None)
             metadata.read_string(metafile)
             controller = metadata.get("run", "controller", fallback=None)
 
-        headers = {"Content-MD5": md5, "controller": controller}
+        headers = {
+            "Content-MD5": md5,
+            "controller": controller,
+            "content-type": "application/octet-stream",
+        }
 
         with tarball.open("rb") as f:
             return self.put(
                 api=API.UPLOAD,
                 uri_params={"filename": tarball.name},
                 headers=headers,
+                params=query_parameters,
                 data=f,
                 raise_error=False,
             )
@@ -425,10 +436,10 @@ class PbenchServerClient:
         while True:
             for d in json["results"]:
                 yield Dataset(d)
-            next = json.get("next_url")
-            if "offset" in args or not next:
+            next_url = json.get("next_url")
+            if "offset" in args or not next_url:
                 break
-            json = self.get(uri=next).json()
+            json = self.get(uri=next_url).json()
 
     def get_metadata(self, dataset_id: str, metadata: list[str]) -> JSONOBJECT:
         """Return requested metadata for a specified dataset.

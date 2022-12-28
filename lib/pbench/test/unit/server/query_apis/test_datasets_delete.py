@@ -152,7 +152,13 @@ class TestDatasetsDelete:
             Dataset.query(name=owner)
 
     def test_partial(
-        self, client, get_document_map, monkeypatch, server_config, pbench_token
+        self,
+        client,
+        capinternal,
+        get_document_map,
+        monkeypatch,
+        server_config,
+        pbench_token,
     ):
         """
         Check the delete API when some document updates fail. We expect an
@@ -165,10 +171,8 @@ class TestDatasetsDelete:
             f"{server_config.rest_uri}/datasets/delete/{ds.resource_id}",
             headers={"authorization": f"Bearer {pbench_token}"},
         )
-
-        # Verify the report and status
-        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
-        assert response.json["message"] == "Failed to update 3 out of 31 documents"
+        assert response.status_code == HTTPStatus.OK
+        assert response.json == {"ok": 28, "failure": 3}
 
         # Verify that the Dataset still exists
         Dataset.query(name="drb")
@@ -188,8 +192,35 @@ class TestDatasetsDelete:
         assert response.status_code == HTTPStatus.NOT_FOUND
         assert response.json["message"] == "Dataset 'badwolf' not found"
 
+    def test_no_index(
+        self, client, monkeypatch, attach_dataset, pbench_token, server_config
+    ):
+        """
+        Check the delete API if the dataset has no INDEX_MAP. It should
+        succeed without tripping over Elasticsearch.
+        """
+        self.fake_cache_manager(monkeypatch)
+        ds = Dataset.query(name="drb")
+        response = client.post(
+            f"{server_config.rest_uri}/datasets/delete/{ds.resource_id}",
+            headers={"authorization": f"Bearer {pbench_token}"},
+        )
+
+        # Verify the report and status
+        assert response.status_code == HTTPStatus.OK
+        assert response.json == {"ok": 0, "failure": 0}
+        with pytest.raises(DatasetNotFound):
+            Dataset.query(name="drb")
+
     def test_exception(
-        self, attach_dataset, client, monkeypatch, pbench_token, server_config
+        self,
+        attach_dataset,
+        capinternal,
+        client,
+        monkeypatch,
+        get_document_map,
+        pbench_token,
+        server_config,
     ):
         """
         Check the delete API response if the bulk helper throws an exception.
@@ -204,7 +235,7 @@ class TestDatasetsDelete:
             raise_on_error: bool = True,
             raise_on_exception: bool = True,
         ):
-            raise elasticsearch.helpers.BulkIndexError
+            raise elasticsearch.helpers.BulkIndexError("test")
 
         monkeypatch.setattr("elasticsearch.helpers.streaming_bulk", fake_bulk)
 
@@ -214,5 +245,4 @@ class TestDatasetsDelete:
         )
 
         # Verify the failure
-        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
-        assert response.json["message"] == HTTPStatus.INTERNAL_SERVER_ERROR.phrase
+        capinternal("Unexpected backend error", response)

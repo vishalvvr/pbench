@@ -4,19 +4,21 @@ from logging import Logger
 from flask.json import jsonify
 from flask.wrappers import Request, Response
 
-from pbench.server import PbenchServerConfig
+from pbench.server import OperationCode, PbenchServerConfig
 from pbench.server.api.resources import (
-    API_AUTHORIZATION,
-    API_METHOD,
-    API_OPERATION,
     APIAbort,
+    ApiAuthorizationType,
     ApiBase,
+    ApiContext,
+    APIInternalError,
+    ApiMethod,
     ApiParams,
     ApiSchema,
     Parameter,
     ParamType,
     Schema,
 )
+from pbench.server.database.models.audit import AuditType
 from pbench.server.database.models.server_config import (
     ServerConfig,
     ServerConfigBadValue,
@@ -34,8 +36,8 @@ class ServerConfiguration(ApiBase):
             config,
             logger,
             ApiSchema(
-                API_METHOD.PUT,
-                API_OPERATION.UPDATE,
+                ApiMethod.PUT,
+                OperationCode.UPDATE,
                 uri_schema=Schema(
                     Parameter("key", ParamType.KEYWORD, keywords=ServerConfig.KEYS)
                 ),
@@ -55,20 +57,24 @@ class ServerConfiguration(ApiBase):
                 body_schema=Schema(
                     Parameter("value", ParamType.JSON),
                 ),
-                authorization=API_AUTHORIZATION.ADMIN,
+                audit_type=AuditType.CONFIG,
+                audit_name="config",
+                authorization=ApiAuthorizationType.ADMIN,
             ),
             ApiSchema(
-                API_METHOD.GET,
-                API_OPERATION.READ,
+                ApiMethod.GET,
+                OperationCode.READ,
                 uri_schema=Schema(
                     Parameter("key", ParamType.KEYWORD, keywords=ServerConfig.KEYS)
                 ),
-                authorization=API_AUTHORIZATION.NONE,
+                authorization=ApiAuthorizationType.NONE,
             ),
             always_enabled=True,
         )
 
-    def _get(self, params: ApiParams, request: Request) -> Response:
+    def _get(
+        self, params: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         Get the values of server configuration parameters.
 
@@ -83,6 +89,7 @@ class ServerConfiguration(ApiBase):
         Args:
             params: API parameters
             request: The original Request object containing query parameters
+            context: API context dictionary
 
         Returns:
             HTTP Response object
@@ -96,9 +103,9 @@ class ServerConfiguration(ApiBase):
             else:
                 return jsonify(ServerConfig.get_all())
         except ServerConfigError as e:
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR, str(e)) from e
+            raise APIInternalError(f"Error reading server configuration {key}") from e
 
-    def _put_key(self, params: ApiParams) -> Response:
+    def _put_key(self, params: ApiParams, context: ApiContext) -> Response:
         """
         Implement the PUT operation when a system configuration setting key is
         specified on the URI as /system/configuration/{key}.
@@ -115,7 +122,7 @@ class ServerConfiguration(ApiBase):
 
         Args:
             params: API parameters
-            request: The original Request object containing query parameters
+            context: CONTEXT dictionary
 
         Returns:
             HTTP Response object
@@ -126,10 +133,7 @@ class ServerConfiguration(ApiBase):
         except KeyError:
             # This "isn't possible" given the Flask mapping rules, but try
             # to report it gracefully instead of letting the KeyError fly.
-            raise APIAbort(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                f"Found URI parameters {sorted(params.uri)} not including 'key'",
-            )
+            raise APIAbort(HTTPStatus.BAD_REQUEST, message="Missing parameter 'key'")
 
         # If we have a key in the URL, then we need a "value" for it, which
         # we can take either from a query parameter or from the JSON
@@ -152,22 +156,24 @@ class ServerConfiguration(ApiBase):
                     f"No value found for key system configuration key {key!r}",
                 )
 
+        context["auditing"]["attributes"] = {"updated": {key: value}}
+
         try:
             ServerConfig.set(key=key, value=value)
         except ServerConfigBadValue as e:
             raise APIAbort(HTTPStatus.BAD_REQUEST, str(e)) from e
         except ServerConfigError as e:
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR, str(e)) from e
+            raise APIInternalError(f"Error setting server configuration {key}") from e
         return jsonify({key: value})
 
-    def _put_body(self, params: ApiParams) -> Response:
+    def _put_body(self, params: ApiParams, context: ApiContext) -> Response:
         """
         Allow setting the value of multiple system configuration settings with
         a single PUT by specifying a JSON request body with key/value pairs.
 
         Args:
             params: API parameters
-            request: The original Request object containing query parameters
+            context: CONTEXT dictionary
 
         Returns:
             HTTP Response object
@@ -183,24 +189,26 @@ class ServerConfiguration(ApiBase):
                 f"Unrecognized configuration parameters {sorted(badkeys)!r} specified: valid parameters are {sorted(ServerConfig.KEYS)!r}",
             )
 
+        context["auditing"]["attributes"] = {"updated": params.body}
+
         failures = []
         response = {}
-        fail_status = HTTPStatus.BAD_REQUEST
         for k, v in params.body.items():
             try:
                 c = ServerConfig.set(key=k, value=v)
                 response[c.key] = c.value
             except ServerConfigBadValue as e:
                 failures.append(str(e))
-            except ServerConfigError as e:
-                fail_status = HTTPStatus.INTERNAL_SERVER_ERROR
-                self.logger.warning(str(e))
-                failures.append(str(e))
+            except Exception as e:
+                self.logger.warning("{}", e)
+                raise APIInternalError(f"Error setting server configuration {k}")
         if failures:
-            raise APIAbort(fail_status, message=", ".join(failures))
+            raise APIAbort(HTTPStatus.BAD_REQUEST, message=", ".join(failures))
         return jsonify(response)
 
-    def _put(self, params: ApiParams, _) -> Response:
+    def _put(
+        self, params: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         Set or modify the values of server configuration keys.
 
@@ -220,12 +228,13 @@ class ServerConfiguration(ApiBase):
         Args:
             params: API parameters
             request: The original Request object containing query parameters
+            context: API context dictionary
 
         Returns:
             HTTP Response object
         """
 
         if params.uri:
-            return self._put_key(params)
+            return self._put_key(params, context)
         else:
-            return self._put_body(params)
+            return self._put_body(params, context)

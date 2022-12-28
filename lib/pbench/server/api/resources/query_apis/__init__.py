@@ -1,11 +1,13 @@
-from collections import Counter, defaultdict
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 import json
 from logging import Logger
 import re
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Iterator, List, Optional
 from urllib.parse import urljoin
+from urllib.request import Request
 
 from dateutil import rrule
 from dateutil.relativedelta import relativedelta
@@ -14,12 +16,14 @@ from flask import jsonify
 from flask.wrappers import Response
 import requests
 
-from pbench.server import JSON, PbenchServerConfig
+from pbench.server import JSON, JSONOBJECT, PbenchServerConfig
 from pbench.server.api.resources import (
-    API_AUTHORIZATION,
-    API_METHOD,
     APIAbort,
+    ApiAuthorizationType,
     ApiBase,
+    ApiContext,
+    APIInternalError,
+    ApiMethod,
     ApiParams,
     ApiSchema,
     ParamType,
@@ -27,13 +31,10 @@ from pbench.server.api.resources import (
     UnauthorizedAccess,
 )
 from pbench.server.auth.auth import Auth
-from pbench.server.database.models.datasets import Dataset
+from pbench.server.database.models.audit import AuditReason, AuditStatus
+from pbench.server.database.models.datasets import Dataset, Metadata, States
 from pbench.server.database.models.template import Template
 from pbench.server.database.models.users import User
-
-# A type defined to allow the preprocess subclass method to provide shared
-# context with the assemble and postprocess methods.
-CONTEXT = Dict[str, Any]
 
 
 class MissingBulkSchemaParameters(SchemaError):
@@ -116,9 +117,9 @@ class ElasticBase(ApiBase):
         port = config.get("elasticsearch", "port")
 
         # TODO: For future flexibility, we should consider reading this entire
-        # Elasticsearch URI from the config file as we do for PostgreSQL rather
-        # than stitching it together. This would allow backend control over
-        # authentication and http vs https for example.
+        # Elasticsearch URI from the config file as we do for the database
+        # rather than stitching it together. This would allow backend control
+        # over authentication and http vs https for example.
         self.es_url = f"http://{host}:{port}"
 
     def _build_elasticsearch_query(
@@ -303,34 +304,25 @@ class ElasticBase(ApiBase):
             )
         return indices
 
-    def preprocess(self, params: ApiParams) -> CONTEXT:
+    def preprocess(self, params: ApiParams, context: ApiContext) -> None:
         """
         Given the client Request payload, perform any preprocessing activities
         necessary prior to constructing an Elasticsearch query.
 
-        The base class assumes no preprocessing is necessary, and returns an
-        empty dictionary to indicate that the Elasticsearch operation should
-        continue; this can be overridden by subclasses as necessary.
-
-        The value returned here (if not None) will be passed to the "assemble"
-        and "postprocess" methods to provide shared context across the set of
-        operations. Note that "assemble" can modify the CONTEXT dict to pass
-        additional context to "postprocess" if necessary.
+        The base class assumes no preprocessing is necessary; this can be
+        overridden by subclasses as necessary.
 
         Args:
             params: Type-normalized client parameters
+            context: API context dictionary
 
         Raises:
             Any errors in the postprocess method shall be reported by
             exceptions which will be logged and will terminate the operation.
-
-        Returns:
-            None if Elasticsearch query shouldn't proceed, or a CONTEXT dict to
-            provide shared context for the assemble and postprocess methods.
         """
-        return {}
+        pass
 
-    def assemble(self, params: ApiParams, context: CONTEXT) -> JSON:
+    def assemble(self, params: ApiParams, context: ApiContext) -> JSON:
         """
         Assemble the Elasticsearch parameters.
 
@@ -338,7 +330,7 @@ class ElasticBase(ApiBase):
 
         Args:
             params: Type-normalized client parameters
-            context: CONTEXT dict returned by preprocess method
+            context: API context dictionary
 
         Raises:
             Any errors in the assemble method shall be reported by exceptions
@@ -355,7 +347,7 @@ class ElasticBase(ApiBase):
         """
         raise NotImplementedError()
 
-    def postprocess(self, es_json: JSON, context: CONTEXT) -> JSON:
+    def postprocess(self, es_json: JSON, context: ApiContext) -> JSON:
         """
         Given the Elasticsearch Response object, construct a JSON document to
         be returned to the original caller.
@@ -364,7 +356,7 @@ class ElasticBase(ApiBase):
 
         Args:
             es_json: Elasticsearch Response payload
-            context: CONTEXT value returned by preprocess method
+            context: context: API context dictionary
 
         Raises:
             Any errors in the postprocess method shall be reported by
@@ -375,29 +367,26 @@ class ElasticBase(ApiBase):
         """
         raise NotImplementedError()
 
-    def _call(self, method: Callable, params: ApiParams):
+    def _call(self, method: Callable, params: ApiParams, context: ApiContext):
         """
         Perform the requested call to Elasticsearch, and handle any exceptions.
 
         Args:
             method: requests package callable (e.g., requests.get)
             params: Type-normalized client parameters
+            context: API context dictionary
 
         Returns:
             Postprocessed JSON body to return to client
         """
         klasname = self.__class__.__name__
         try:
-            context = self.preprocess(params)
+            self.preprocess(params, context)
             self.logger.debug("PREPROCESS returns {}", context)
-            if context is None:
-                return "", HTTPStatus.NO_CONTENT
         except UnauthorizedAccess as e:
-            self.logger.warning("{}", e)
             raise APIAbort(e.http_status, str(e))
         except KeyError as e:
-            self.logger.exception("{} problem in preprocess, missing {}", klasname, e)
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            raise APIInternalError(f"problem in preprocess, missing {e}") from e
         try:
             # prepare payload for Elasticsearch query
             es_request = self.assemble(params, context)
@@ -409,8 +398,7 @@ class ElasticBase(ApiBase):
                 es_request.get("kwargs").get("json"),
             )
         except Exception as e:
-            self.logger.exception("{} assembly failed: {}", klasname, e)
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            raise APIInternalError("Elasticsearch assembly error") from e
 
         try:
             # perform the Elasticsearch query
@@ -423,7 +411,7 @@ class ElasticBase(ApiBase):
             es_response.raise_for_status()
             json_response = es_response.json()
         except requests.exceptions.HTTPError as e:
-            self.logger.exception(
+            self.logger.error(
                 "{} HTTP error {} from Elasticsearch request: {}",
                 klasname,
                 e,
@@ -434,55 +422,38 @@ class ElasticBase(ApiBase):
                 f"Elasticsearch query failure {e.response.reason} ({e.response.status_code})",
             )
         except requests.exceptions.ConnectionError:
-            self.logger.exception(
+            self.logger.error(
                 "{}: connection refused during the Elasticsearch request", klasname
             )
             raise APIAbort(
                 HTTPStatus.BAD_GATEWAY, "Network problem, could not reach Elasticsearch"
             )
         except requests.exceptions.Timeout:
-            self.logger.exception(
+            self.logger.error(
                 "{}: connection timed out during the Elasticsearch request", klasname
             )
             raise APIAbort(
                 HTTPStatus.GATEWAY_TIMEOUT,
                 "Connection timed out, could reach Elasticsearch",
             )
-        except requests.exceptions.InvalidURL:
-            self.logger.exception(
-                "{}: invalid url {} during the Elasticsearch request", klasname, url
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+        except requests.exceptions.InvalidURL as e:
+            raise APIInternalError(f"Invalid Elasticsearch URL {url}") from e
         except Exception as e:
-            self.logger.exception(
-                "{}: exception {} occurred during the Elasticsearch request",
-                klasname,
-                type(e).__name__,
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            raise APIInternalError("Unexpected backend error") from e
 
         try:
             # postprocess Elasticsearch response
             return self.postprocess(json_response, context)
         except PostprocessError as e:
-            msg = f"{klasname}: the query postprocessor was unable to complete: {e}"
-            self.logger.warning("{}", msg)
-            raise APIAbort(e.status, str(e.message))
-        except KeyError as e:
-            self.logger.error("{}: missing Elasticsearch key {}", klasname, e)
-            raise APIAbort(
-                HTTPStatus.INTERNAL_SERVER_ERROR, f"Missing Elasticsearch key {e}"
-            )
+            msg = f"{klasname}: {str(e)}"
+            self.logger.error("{}", msg)
+            raise APIAbort(e.status, msg)
         except Exception as e:
-            self.logger.exception(
-                "{}: unexpected problem postprocessing Elasticsearch response {}: {}",
-                klasname,
-                json_response,
-                e,
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            raise APIInternalError("Unexpected backend exception") from e
 
-    def _post(self, params: ApiParams, _) -> Response:
+    def _post(
+        self, params: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         Handle a Pbench server POST operation that will involve a call to the
         server's configured Elasticsearch instance. The assembly and
@@ -490,16 +461,37 @@ class ElasticBase(ApiBase):
         subclasses through the assemble() and postprocess() methods;
         we rely on the ApiBase superclass to provide basic JSON parameter
         validation and normalization.
-        """
-        return self._call(requests.post, params)
 
-    def _get(self, params: ApiParams, _) -> Response:
+        Args:
+            method: The API HTTP method
+            request: The flask Request object containing payload and headers
+            uri_params: URI encoded keyword-arg supplied by the Flask
+                framework
+        """
+        return self._call(requests.post, params, context)
+
+    def _get(
+        self, params: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         Handle a GET operation involving a call to the server's Elasticsearch
         instance. The post-processing of the Elasticsearch query is handled
         the subclasses through their postprocess() methods.
+
+        Args:
+            method: The API HTTP method
+            request: The flask Request object containing payload and headers
+            uri_params: URI encoded keyword-arg supplied by the Flask
+                framework
         """
-        return self._call(requests.get, params)
+        return self._call(requests.get, params, context)
+
+
+@dataclass
+class BulkResults:
+    errors: int
+    count: int
+    report: defaultdict
 
 
 class ElasticBulkBase(ApiBase):
@@ -522,6 +514,8 @@ class ElasticBulkBase(ApiBase):
         logger: Logger,
         *schemas: ApiSchema,
         action: Optional[str] = None,
+        require_stable: bool = False,
+        require_map: bool = False,
     ):
         """
         Base class constructor.
@@ -546,6 +540,9 @@ class ElasticBulkBase(ApiBase):
                     body_schema=Schema(Parameter("start", ParamType.DATE)),
                     uri_schema=Schema(Parameter("dataset", ParamType.DATASET))
                 )
+            action: bulk Elasticsearch action (delete, create, update)
+            require_stable: if True, fail if dataset state is mutating (-ing state)
+            require_map: if True, fail if the dataset has no index map
         """
         super().__init__(config, logger, *schemas)
         host = config.get("elasticsearch", "host")
@@ -554,12 +551,14 @@ class ElasticBulkBase(ApiBase):
         api_name = self.__class__.__name__
 
         # TODO: For future flexibility, we should consider reading this entire
-        # Elasticsearch URI from the config file as we do for PostgreSQL rather
-        # than stitching it together. This would allow backend control over
-        # authentication and http vs https for example.
+        # Elasticsearch URI from the config file as we do for the database
+        # rather than stitching it together. This would allow backend control
+        # over authentication and http vs https for example.
         self.elastic_uri = f"http://{host}:{port}"
-        self.action = action
         self.config = config
+        self.action = action
+        self.require_stable = require_stable
+        self.require_map = require_map
 
         # Look for a parameter of type DATASET. It may be defined in any of the
         # three schemas (uri, query parameter, or request body), and we don't
@@ -569,7 +568,7 @@ class ElasticBulkBase(ApiBase):
         if not schemas:
             raise MissingBulkSchemaParameters(api_name, "no schema provided")
         dset = self.schemas.get_param_by_type(
-            API_METHOD.POST,
+            ApiMethod.POST,
             ParamType.DATASET,
             ApiParams(),
         )
@@ -577,12 +576,18 @@ class ElasticBulkBase(ApiBase):
             raise MissingBulkSchemaParameters(
                 api_name, "dataset parameter is not defined or not required"
             )
-        if self.schemas[API_METHOD.POST].authorization != API_AUTHORIZATION.DATASET:
+        if self.schemas[ApiMethod.POST].authorization != ApiAuthorizationType.DATASET:
             raise MissingBulkSchemaParameters(
                 api_name, "schema authorization is not by dataset"
             )
 
-    def generate_actions(self, params: ApiParams, dataset: Dataset) -> Iterator[dict]:
+    def generate_actions(
+        self,
+        params: ApiParams,
+        dataset: Dataset,
+        context: ApiContext,
+        map: dict[str, list[str]],
+    ) -> Iterator[dict]:
         """
         Generate a series of Elasticsearch bulk operation actions driven by the
         dataset document map. For example:
@@ -597,15 +602,19 @@ class ElasticBulkBase(ApiBase):
         This is an abstract method that must be implemented by a subclass.
 
         Args:
-            params: Type-normalized client parameters
+            params: Type-normalized client request body JSON
             dataset: The associated Dataset object
+            context: The operation's ApiContext
+            map: Elasticsearch index document map
 
         Returns:
             Sequence of Elasticsearch bulk action dict objects
         """
         raise NotImplementedError()
 
-    def complete(self, dataset: Dataset, params: ApiParams, summary: JSON) -> None:
+    def complete(
+        self, dataset: Dataset, context: ApiContext, summary: JSONOBJECT
+    ) -> None:
         """
         Complete a bulk Elasticsearch operation, perhaps by modifying the
         source Dataset resource.
@@ -615,14 +624,85 @@ class ElasticBulkBase(ApiBase):
 
         Args:
             dataset: The associated Dataset object.
-            params: Type-normalized client parameters
+            context: The operation's ApiContext
             summary: The summary document of the operation:
                 ok      Count of successful actions
                 failure Count of failing actions
         """
         pass
 
-    def _post(self, params: ApiParams, _) -> Response:
+    def _analyze_bulk(self, results: Iterator[tuple[bool, Any]]) -> BulkResults:
+        """Elasticsearch returns one response result per action. Each is a
+        JSON document where the first-level key is the action name
+        ("update", "delete", etc.) and the value of that key includes the
+        action's "status", "_index", etc; and, on failure, an "error" key
+        the value of which gives the type and reason for the failure.
+
+        We assume there will be a single first-level key corresponding to
+        the action generated by the subclass and we use that without any
+        validation to access the status information.
+
+        Internally report a summary of successes and Elasticsearch failure
+        reasons: this will look something like
+
+        {
+          "ok": {
+            "index1": 1,
+            "index2": 500,
+            ...
+          },
+          "elasticsearch failure reason 1": {
+            "index2": 5,
+            "index5": 10
+            ...
+          },
+          "elasticsearch failure reason 2": {
+            "index3": 2,
+            "index4": 15
+            ...
+          }
+        }
+        """
+        report = defaultdict(lambda: defaultdict(int))
+        errors = 0
+        count = 0
+
+        for ok, response in results:
+            count += 1
+            u = response[self.action]
+            status = "ok"
+            if "error" in u:
+                e = u["error"]
+                # The bulk helper seems to return a stringified exception
+                # as the "error" key value, at least in some cases. The
+                # documentation is not entirely clear, so to be safe this
+                # handles either a stringified exception or the standard
+                # Elasticsearch server bulk action response, where "error"
+                # is a dict with details. If the type of "error" isn't
+                # either of these, just stringify it.
+                #
+                # For the stringified exception, we try to extract the
+                # leading exception name (e.g., 'ConnectionError(...)') for
+                # a simpler and more readable error report key; if the
+                # pattern doesn't match, use the entire string.
+                if isinstance(e, str):
+                    match = self.EXCEPTION_NAME.match(e)
+                    if match:
+                        status = match[1]
+                    else:
+                        status = e
+                elif isinstance(e, dict) and "reason" in e:
+                    status = e["reason"]
+                else:
+                    status = str(e)
+                errors += 1
+            index = u["_index"]
+            report[status][index] += 1
+        return BulkResults(errors=errors, count=count, report=report)
+
+    def _post(
+        self, params: ApiParams, request: Request, context: ApiContext
+    ) -> Response:
         """
         Perform the requested POST operation, and handle any exceptions.
 
@@ -636,142 +716,85 @@ class ElasticBulkBase(ApiBase):
 
         Args:
             params: Type-normalized client parameters
-            _: Original incoming Request object (not used)
+            request: Original incoming Request object (not used)
+            context: API context
 
         Returns:
             Response to return to client
         """
-        klasname = self.__class__.__name__
 
         # Our schema requires a valid dataset and uses it to authorize access;
         # therefore the unconditional dereference is assumed safe.
         dataset = self.schemas.get_param_by_type(
-            API_METHOD.POST, ParamType.DATASET, params
+            ApiMethod.POST, ParamType.DATASET, params
         ).value
 
-        # Build an Elasticsearch instance to manage the bulk update
-        elastic = Elasticsearch(self.elastic_uri)
-        self.logger.info("Elasticsearch {} [{}]", elastic, VERSION)
-
-        # Internally report a summary of successes and Elasticsearch failure
-        # reasons: this will look something like
-        #
-        # {
-        #   "ok": {
-        #     "index1": 1,
-        #     "index2": 500,
-        #     ...
-        #   },
-        #   "elasticsearch failure reason 1": {
-        #     "index2": 5,
-        #     "index5": 10
-        #     ...
-        #   },
-        #   "elasticsearch failure reason 2": {
-        #     "index3": 2,
-        #     "index4": 15
-        #     ...
-        #   }
-        # }
-        report = defaultdict(Counter)
-        count = 0
-        error_count = 0
-
-        # NOTE: because streaming_bulk is given a generator, and also
-        # returns a generator, we consume the entire sequence within the
-        # `try` block to catch failures.
-        try:
-            # Pass the bulk command generator to the helper
-            results = helpers.streaming_bulk(
-                elastic,
-                self.generate_actions(params.body, dataset),
-                raise_on_exception=False,
-                raise_on_error=False,
+        if self.require_stable and dataset.state.mutating:
+            raise APIAbort(
+                HTTPStatus.CONFLICT,
+                f"Dataset state {dataset.state.friendly!r} is mutating",
             )
 
-            # Elasticsearch returns one response result per action. Each is a
-            # JSON document where the first-level key is the action name
-            # ("update", "delete", etc.) and the value of that key includes the
-            # action's "status", "_index", etc; and, on failure, an "error" key
-            # the value of which gives the type and reason for the failure.
-            #
-            # We assume there will be a single first-level key corresponding to
-            # the action generated by the subclass and we use that without any
-            # validation to access the status information.
-            for ok, response in results:
-                count += 1
-                u = response[self.action]
-                status = "ok"
-                if "error" in u:
-                    e = u["error"]
-                    # The bulk helper seems to return a stringified exception
-                    # as the "error" key value, at least in some cases. The
-                    # documentation is not entirely clear, so to be safe this
-                    # handles either a stringified exception or the standard
-                    # Elasticsearch server bulk action response, where "error"
-                    # is a dict with details. If the type of "error" isn't
-                    # either of these, just stringify it.
-                    #
-                    # For the stringified exception, we try to extract the
-                    # leading exception name (e.g., 'ConnectionError(...)') for
-                    # a simpler and more readable error report key; if the
-                    # pattern doesn't match, use the entire string.
-                    if isinstance(e, str):
-                        match = self.EXCEPTION_NAME.match(e)
-                        if match:
-                            status = match[1]
-                        else:
-                            status = e
-                    elif isinstance(e, dict) and "reason" in e:
-                        status = e["reason"]
-                    else:
-                        status = str(e)
-                    error_count += 1
-                report[status][u["_index"]] += 1
-        except Exception as e:
-            self.logger.exception(
-                "{}: exception {} occurred during the Elasticsearch request: report {}",
-                klasname,
-                type(e).__name__,
-                report,
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+        map = Metadata.getvalue(dataset=dataset, key=Metadata.INDEX_MAP)
 
-        summary = {"ok": count - error_count, "failure": error_count}
+        # If we don't have an Elasticsearch index-map, then the dataset isn't
+        # indexed and we skip the Elasticsearch actions.
+        if map:
+            # Build an Elasticsearch instance to manage the bulk update
+            elastic = Elasticsearch(self.elastic_uri)
+            self.logger.info("Elasticsearch {} [{}]", elastic, VERSION)
+
+            # NOTE: because both generate_actions and streaming_bulk return
+            # generators, the entire sequence is inside a single try block.
+            try:
+                results = helpers.streaming_bulk(
+                    elastic,
+                    self.generate_actions(params, dataset, context, map),
+                    raise_on_exception=False,
+                    raise_on_error=False,
+                )
+                report = self._analyze_bulk(results)
+            except Exception as e:
+                raise APIInternalError("Unexpected backend error") from e
+        elif self.require_map:
+            raise APIAbort(
+                HTTPStatus.CONFLICT,
+                f"Dataset {self.action} requires {States.INDEXED.friendly!r} "
+                f"dataset but state is {dataset.state.friendly!r}",
+            )
+        else:
+            report = BulkResults(errors=0, count=0, report={})
+
+        summary: JSONOBJECT = {
+            "ok": report.count - report.errors,
+            "failure": report.errors,
+        }
+        auditing: dict[str, Any] = context["auditing"]
+        attributes: JSONOBJECT = {"summary": summary}
+        auditing["attributes"] = attributes
 
         # Let the subclass complete the operation
         try:
-            self.complete(dataset, params.body, summary)
+            self.complete(dataset, context, summary)
         except Exception as e:
-            self.logger.exception(
-                "{}: exception {} occurred during bulk operation completion",
-                klasname,
-                type(e).__name__,
-            )
-            raise APIAbort(HTTPStatus.INTERNAL_SERVER_ERROR)
+            attributes["message"] = str(e)
+            auditing["status"] = AuditStatus.WARNING
+            auditing["reason"] = AuditReason.INTERNAL
+            raise APIInternalError("Unexpected completion error") from e
 
         # Return the summary document as the success response, or abort with an
-        # internal error if we weren't 100% successful. Some elasticsearch
-        # documents may have been affected, but the client will be able to try
-        # again.
+        # internal error if we tried to operate on Elasticsearch documents but
+        # experienced total failure. Either way, the operation can be retried
+        # if some documents failed to update.
         #
         # TODO: switching to `pyesbulk` will automatically handle retrying on
         # non-terminal errors, but this requires some cleanup work on the
         # pyesbulk side.
-        if error_count > 0:
-            self.logger.error(
-                "{}:dataset {}: {} successful document actions and {} failures: {}",
-                klasname,
-                dataset,
-                count - error_count,
-                error_count,
-                json.dumps(report),
+        if report.count and report.errors == report.count:
+            auditing["status"] = AuditStatus.WARNING
+            auditing["reason"] = AuditReason.INTERNAL
+            attributes["message"] = f"Unable to {self.action} some indexed documents"
+            raise APIInternalError(
+                f"Failed to {self.action} any of {report.count} Elasticsearch documents: {json.dumps(report.report)}"
             )
-            raise APIAbort(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                f"Failed to update {error_count} out of {count} documents",
-            )
-        self.logger.info(
-            "{}:dataset {}: {} successful document actions", klasname, dataset, count
-        )
         return jsonify(summary)

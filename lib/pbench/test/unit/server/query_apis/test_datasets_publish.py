@@ -1,5 +1,4 @@
 from http import HTTPStatus
-from logging import ERROR
 from typing import Iterator
 
 import elasticsearch
@@ -127,7 +126,7 @@ class TestDatasetsPublish:
         response = client.post(
             f"{server_config.rest_uri}/datasets/publish/{ds.resource_id}",
             headers=build_auth_header["header"],
-            json=self.PAYLOAD,
+            query_string=self.PAYLOAD,
         )
         assert response.status_code == expected_status
         if expected_status == HTTPStatus.OK:
@@ -138,7 +137,6 @@ class TestDatasetsPublish:
     def test_partial(
         self,
         attach_dataset,
-        caplog,
         client,
         get_document_map,
         monkeypatch,
@@ -154,17 +152,10 @@ class TestDatasetsPublish:
         response = client.post(
             f"{server_config.rest_uri}/datasets/publish/random_md5_string1",
             headers={"authorization": f"Bearer {pbench_token}"},
-            json=self.PAYLOAD,
+            query_string=self.PAYLOAD,
         )
-
-        # Verify the report and status
-        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
-        assert response.json["message"] == "Failed to update 3 out of 31 documents"
-        assert (
-            "pbench.server.api",
-            ERROR,
-            'DatasetsPublish:dataset (3)|drb: 28 successful document actions and 3 failures: {"Just kidding": {"unit-test.v6.run-data.2021-06": 1, "unit-test.v6.run-toc.2021-06": 1, "unit-test.v5.result-data-sample.2021-06": 1}, "ok": {"unit-test.v6.run-toc.2021-06": 9, "unit-test.v5.result-data-sample.2021-06": 19}}',
-        ) in caplog.record_tuples
+        assert response.status_code == HTTPStatus.OK
+        assert response.json == {"ok": 28, "failure": 3}
 
         # Verify that the Dataset access didn't change
         dataset = Dataset.query(name="drb")
@@ -180,15 +171,44 @@ class TestDatasetsPublish:
         response = client.post(
             f"{server_config.rest_uri}/datasets/publish/badwolf",
             headers={"authorization": f"Bearer {pbench_token}"},
-            json=self.PAYLOAD,
+            query_string=self.PAYLOAD,
         )
 
         # Verify the report and status
         assert response.status_code == HTTPStatus.NOT_FOUND
         assert response.json["message"] == "Dataset 'badwolf' not found"
 
+    def test_no_index(
+        self, client, monkeypatch, attach_dataset, pbench_token, server_config
+    ):
+        """
+        Check the publish API if the dataset has no INDEX_MAP. It should
+        fail with a CONFLICT error.
+        """
+        self.fake_elastic(monkeypatch, {}, True)
+
+        ds = Dataset.query(name="drb")
+        response = client.post(
+            f"{server_config.rest_uri}/datasets/publish/{ds.resource_id}",
+            headers={"authorization": f"Bearer {pbench_token}"},
+            query_string=self.PAYLOAD,
+        )
+
+        # Verify the report and status
+        assert response.status_code == HTTPStatus.CONFLICT
+        assert response.json == {
+            "message": "Dataset update requires 'Indexed' dataset but state is 'Indexed'"
+        }
+
     def test_exception(
-        self, attach_dataset, client, monkeypatch, pbench_token, server_config
+        self,
+        attach_dataset,
+        client,
+        monkeypatch,
+        get_document_map,
+        pbench_token,
+        server_config,
+        capinternal,
     ):
         """
         Check the publish API response if the bulk helper throws an exception.
@@ -203,16 +223,15 @@ class TestDatasetsPublish:
             raise_on_error: bool = True,
             raise_on_exception: bool = True,
         ):
-            raise elasticsearch.helpers.BulkIndexError
+            raise elasticsearch.helpers.BulkIndexError("test")
 
         monkeypatch.setattr("elasticsearch.helpers.streaming_bulk", fake_bulk)
 
         response = client.post(
             f"{server_config.rest_uri}/datasets/publish/random_md5_string1",
             headers={"authorization": f"Bearer {pbench_token}"},
-            json=self.PAYLOAD,
+            query_string=self.PAYLOAD,
         )
 
         # Verify the failure
-        assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
-        assert response.json["message"] == HTTPStatus.INTERNAL_SERVER_ERROR.phrase
+        capinternal("Unexpected backend error", response)
